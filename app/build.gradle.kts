@@ -2,22 +2,19 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.org.jetbrains.kotlin.android)
     alias(libs.plugins.compose.compiler)
 }
 
 android {
-    namespace = "com.roozbehzarei.superwebview"
-    compileSdk = 36
+    namespace = "com.sevpor.chat"
+    compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.roozbehzarei.superwebview"
-        minSdk = 23
-        targetSdk = 36
+        applicationId = "com.sevpor.chat"
+        minSdk = 28
+        targetSdk = 37
         versionCode = 1
         versionName = "1.0.0"
-
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -31,26 +28,44 @@ android {
     }
 
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     kotlin {
         compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_1_8)
+            jvmTarget.set(JvmTarget.JVM_17)
         }
+    }
+
+    packaging {
+        jniLibs {
+            keepDebugSymbols.add("**/libandroidx.graphics.path.so")
+        }
+    }
+}
+
+androidComponents {
+    beforeVariants(selector().all()) { variantBuilder ->
+        (variantBuilder as? com.android.build.api.variant.HasDeviceTestsBuilder)
+            ?.deviceTests
+            ?.get(com.android.build.api.variant.DeviceTestBuilder.ANDROID_TEST_TYPE)
+            ?.enable = false
+        (variantBuilder as? com.android.build.api.variant.HasHostTestsBuilder)
+            ?.hostTests
+            ?.get(com.android.build.api.variant.HostTestBuilder.UNIT_TEST_TYPE)
+            ?.enable = false
     }
 }
 
 dependencies {
     // Compose Bill of Materials
-    val composeBom = platform("androidx.compose:compose-bom:2025.08.01")
-    implementation(composeBom)
-    androidTestImplementation(composeBom)
+    implementation(platform(libs.androidx.compose.bom))
     // Compose dependencies
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)

@@ -1,4 +1,4 @@
-package com.roozbehzarei.superwebview.ui.theme
+package com.sevpor.chat.ui.theme
 
 import androidx.compose.material3.Typography
 

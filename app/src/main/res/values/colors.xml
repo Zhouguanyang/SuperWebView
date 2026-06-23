@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <color name="app_background">#F8F8F8</color>
     <color name="seed">#4d5e81</color>
     <color name="md_theme_light_primary">#2F5DA8</color>
     <color name="md_theme_light_onPrimary">#FFFFFF</color>

@@ -1,9 +1,9 @@
-package com.roozbehzarei.superwebview
+package com.sevpor.chat
 
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Bitmap
-import android.os.Build
+import android.graphics.Color
 import android.os.Bundle
 import android.view.View
 import android.webkit.WebChromeClient
@@ -12,8 +12,10 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -35,9 +37,11 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
-import com.roozbehzarei.superwebview.ui.theme.SuperWebViewTheme
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
+import com.sevpor.chat.ui.theme.SuperWebViewTheme
 
-private const val WEBSITE = "https://roozbehzarei.com"
+private const val WEBSITE = "https://chat.sevpor.com"
 
 /**
  * Main activity of the application.
@@ -52,6 +56,10 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT),
+        )
         super.onCreate(savedInstanceState)
         setContent {
             SuperWebViewTheme {
@@ -133,6 +141,7 @@ private fun WebViewWithRefresher(
     val primaryColorArgb = MaterialTheme.colorScheme.primary.toArgb()
     val secondaryColorArgb = MaterialTheme.colorScheme.secondary.toArgb()
     val tertiaryColorArgb = MaterialTheme.colorScheme.tertiary.toArgb()
+    val backgroundColorArgb = MaterialTheme.colorScheme.background.toArgb()
 
     // Override back navigation to allow WebView to go back in its history
     BackHandler(enabled = isBackEnabled) {
@@ -141,6 +150,7 @@ private fun WebViewWithRefresher(
     AndroidView(modifier = modifier.fillMaxSize(), factory = { context ->
         // Create SwipeRefreshLayout
         val swipeRefreshLayout = SwipeRefreshLayout(context).apply {
+            setBackgroundColor(backgroundColorArgb)
             setColorSchemeColors(
                 primaryColorArgb, secondaryColorArgb, tertiaryColorArgb
             )
@@ -152,6 +162,7 @@ private fun WebViewWithRefresher(
         // Create and configure WebView
         webView = WebView(context).apply {
             id = webViewId
+            setBackgroundColor(backgroundColorArgb)
             webViewClient = object : WebViewClient() {
 
                 /**
@@ -215,9 +226,8 @@ private fun WebViewWithRefresher(
                 domStorageEnabled = true
                 javaScriptEnabled = true
                 setSupportZoom(false)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    isAlgorithmicDarkeningAllowed =
-                        true // Enable algorithmic dark mode on Android Tiramisu+
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+                    WebSettingsCompat.setAlgorithmicDarkeningAllowed(this, false)
                 }
             }
             loadUrl(WEBSITE) // Load the initial website
@@ -228,6 +238,8 @@ private fun WebViewWithRefresher(
         // Re-obtain the WebView instance during recomposition/update
         // This is necessary because the factory lambda might not be re-executed
         val view = swipeRefreshLayout.findViewById<WebView>(webViewId)
+        swipeRefreshLayout.setBackgroundColor(backgroundColorArgb)
+        view?.setBackgroundColor(backgroundColorArgb)
         webView = view
     })
 
