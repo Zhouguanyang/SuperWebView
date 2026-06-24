@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">LobeHub</string>
+    <string name="error_title">出错了</string>
+    <string name="button_retry">重试</string>
+    <string name="error_message">出了点问题。</string>
+    <string name="file_chooser_title">选择文件</string>
+    <string name="download_started">已开始下载</string>
+    <string name="download_failed">下载失败</string>
+    <string name="download_not_supported">WebView 不支持此下载</string>
+    <string name="press_back_again_to_exit">再按一次返回桌面</string>
+</resources>
