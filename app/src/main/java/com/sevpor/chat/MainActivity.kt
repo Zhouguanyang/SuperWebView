@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.DownloadManager
 import android.content.ActivityNotFoundException
+import android.content.ClipData
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -34,6 +35,7 @@ import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -60,6 +62,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.webkit.WebSettingsCompat
@@ -69,6 +72,7 @@ import com.sevpor.chat.ui.theme.SuperWebViewTheme
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Locale
 
 private const val WEBSITE = "https://chat.sevpor.com"
 private const val TAG = "SevporWebView"
@@ -79,6 +83,9 @@ private const val EXIT_BACK_PRESS_INTERVAL_MS = 2_000L
 class MainActivity : ComponentActivity() {
 
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private var pendingFileChooserCaptureUri: Uri? = null
+    private var pendingFileChooserCaptureFile: File? = null
+    private var pendingFileChooserCaptureParams: WebChromeClient.FileChooserParams? = null
     private var pendingPermissionRequest: PermissionRequest? = null
     private var pendingPermissionResources: Array<String> = emptyArray()
     private var pendingGeolocationOrigin: String? = null
@@ -88,10 +95,49 @@ class MainActivity : ComponentActivity() {
     private val fileChooserLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             val callback = filePathCallback ?: return@registerForActivityResult
-            callback.onReceiveValue(
-                WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
-            )
-            filePathCallback = null
+            try {
+                callback.onReceiveValue(
+                    parseSelectedFileUris(result.resultCode, result.data)
+                        ?: parseCaptureOutputUri(result.resultCode)
+                        ?: WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Unable to parse selected files", e)
+                callback.onReceiveValue(null)
+            } finally {
+                if (result.resultCode != Activity.RESULT_OK) {
+                    clearPendingFileChooserCapture(deleteFile = true)
+                } else {
+                    clearPendingFileChooserCapture(deleteFile = false)
+                }
+                filePathCallback = null
+            }
+        }
+
+    private val fileChooserCapturePermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+            val callback = filePathCallback ?: return@registerForActivityResult
+            val params = pendingFileChooserCaptureParams ?: return@registerForActivityResult
+            pendingFileChooserCaptureParams = null
+
+            val granted = capturePermissionsFor(params).all { permission ->
+                isPermissionGranted(permission, result)
+            }
+            if (!granted) {
+                callback.onReceiveValue(null)
+                filePathCallback = null
+                clearPendingFileChooserCapture(deleteFile = true)
+                return@registerForActivityResult
+            }
+
+            try {
+                fileChooserLauncher.launch(createFileChooserIntent(params))
+            } catch (e: Exception) {
+                Log.e(TAG, "Unable to launch capture intent", e)
+                callback.onReceiveValue(null)
+                filePathCallback = null
+                clearPendingFileChooserCapture(deleteFile = true)
+            }
         }
 
     private val webPermissionLauncher =
@@ -99,7 +145,8 @@ class MainActivity : ComponentActivity() {
             val request = pendingPermissionRequest ?: return@registerForActivityResult
             val resources = pendingPermissionResources
             val grantedResources = resources.filter { resource ->
-                androidPermissionsForWebResource(resource).all { permission ->
+                val permissions = androidPermissionsForWebResource(resource) ?: return@filter false
+                permissions.all { permission ->
                     isPermissionGranted(permission, result)
                 }
             }.toTypedArray()
@@ -175,6 +222,8 @@ class MainActivity : ComponentActivity() {
         CookieManager.getInstance().flush()
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
+        clearPendingFileChooserCapture(deleteFile = true)
+        pendingFileChooserCaptureParams = null
         pendingPermissionRequest?.deny()
         pendingPermissionRequest = null
         val origin = pendingGeolocationOrigin
@@ -193,33 +242,169 @@ class MainActivity : ComponentActivity() {
         params: WebChromeClient.FileChooserParams,
     ): Boolean {
         filePathCallback?.onReceiveValue(null)
+        clearPendingFileChooserCapture(deleteFile = true)
+        pendingFileChooserCaptureParams = null
         filePathCallback = callback
+
+        val capturePermissions = capturePermissionsFor(params).filter { !isPermissionGranted(it) }
+        if (capturePermissions.isNotEmpty()) {
+            pendingFileChooserCaptureParams = params
+            fileChooserCapturePermissionLauncher.launch(capturePermissions.toTypedArray())
+            return true
+        }
+
         return try {
-            fileChooserLauncher.launch(
-                Intent.createChooser(params.createIntent(), getString(R.string.file_chooser_title))
-            )
+            fileChooserLauncher.launch(createFileChooserIntent(params))
             true
         } catch (e: ActivityNotFoundException) {
             Log.e(TAG, "No file chooser available", e)
             filePathCallback?.onReceiveValue(null)
             filePathCallback = null
+            pendingFileChooserCaptureParams = null
+            clearPendingFileChooserCapture(deleteFile = true)
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to create file chooser", e)
+            filePathCallback?.onReceiveValue(null)
+            filePathCallback = null
+            pendingFileChooserCaptureParams = null
+            clearPendingFileChooserCapture(deleteFile = true)
             false
         }
     }
 
+    private fun capturePermissionsFor(params: WebChromeClient.FileChooserParams): Array<String> {
+        if (
+            !params.isCaptureEnabled ||
+            params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+        ) {
+            return emptyArray()
+        }
+
+        return when (captureMediaTypeFor(params.acceptTypes)) {
+            CaptureMediaType.IMAGE,
+            CaptureMediaType.VIDEO -> arrayOf(Manifest.permission.CAMERA)
+            CaptureMediaType.AUDIO -> arrayOf(Manifest.permission.RECORD_AUDIO)
+            null -> emptyArray()
+        }
+    }
+
+    private fun createFileChooserIntent(params: WebChromeClient.FileChooserParams): Intent {
+        if (
+            params.isCaptureEnabled &&
+            params.mode != WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+        ) {
+            createCaptureIntent(params)?.let { return it }
+        }
+
+        val intent = params.createIntent().apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            if (params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE) {
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            }
+        }
+        return Intent.createChooser(intent, getString(R.string.file_chooser_title)).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+
+    private fun createCaptureIntent(params: WebChromeClient.FileChooserParams): Intent? =
+        when (captureMediaTypeFor(params.acceptTypes)) {
+            CaptureMediaType.IMAGE -> Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                putCaptureOutput(createCaptureOutputUri("images", ".jpg"))
+            }
+            CaptureMediaType.VIDEO -> Intent(MediaStore.ACTION_VIDEO_CAPTURE).apply {
+                putCaptureOutput(createCaptureOutputUri("videos", ".mp4"))
+            }
+            CaptureMediaType.AUDIO -> Intent(MediaStore.Audio.Media.RECORD_SOUND_ACTION)
+            null -> null
+        }
+
+    private fun Intent.putCaptureOutput(outputUri: Uri) {
+        putExtra(MediaStore.EXTRA_OUTPUT, outputUri)
+        clipData = ClipData.newUri(contentResolver, "Capture output", outputUri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+    }
+
+    private fun createCaptureOutputUri(directoryName: String, extension: String): Uri {
+        val directory = File(externalCacheDir ?: cacheDir, "webview-captures/$directoryName")
+        if (!directory.exists() && !directory.mkdirs()) {
+            error("Unable to create capture directory")
+        }
+        val file = File.createTempFile("capture_", extension, directory)
+        pendingFileChooserCaptureFile = file
+        pendingFileChooserCaptureUri = FileProvider.getUriForFile(
+            this,
+            "$packageName.fileprovider",
+            file,
+        )
+        return pendingFileChooserCaptureUri ?: error("Unable to create capture URI")
+    }
+
+    private fun parseCaptureOutputUri(resultCode: Int): Array<Uri>? {
+        if (resultCode != Activity.RESULT_OK) return null
+        return pendingFileChooserCaptureUri?.let { arrayOf(it) }
+    }
+
+    private fun clearPendingFileChooserCapture(deleteFile: Boolean) {
+        if (deleteFile) {
+            runCatching { pendingFileChooserCaptureFile?.delete() }
+        }
+        pendingFileChooserCaptureUri = null
+        pendingFileChooserCaptureFile = null
+    }
+
+    private fun parseSelectedFileUris(resultCode: Int, data: Intent?): Array<Uri>? {
+        if (resultCode != Activity.RESULT_OK || data == null) return null
+
+        val uris = mutableListOf<Uri>()
+        data.clipData?.let { clipData ->
+            for (index in 0 until clipData.itemCount) {
+                clipData.getItemAt(index).uri?.let { uri ->
+                    if (uri !in uris) uris += uri
+                }
+            }
+        }
+        data.data?.let { uri ->
+            if (uri !in uris) uris += uri
+        }
+        if (uris.isEmpty()) {
+            data.dataString
+                ?.takeIf { it.isNotBlank() }
+                ?.let { Uri.parse(it) }
+                ?.let { uris += it }
+        }
+
+        return uris.takeIf { it.isNotEmpty() }?.toTypedArray()
+    }
+
     private fun requestWebPermission(request: PermissionRequest) {
-        val permissions = request.resources
-            .flatMap { androidPermissionsForWebResource(it).asIterable() }
+        val supportedResources = request.resources
+            .filter { androidPermissionsForWebResource(it) != null }
+            .toTypedArray()
+        if (supportedResources.isEmpty()) {
+            Log.w(TAG, "Denying unsupported WebView permission resources: ${request.resources.joinToString()}")
+            request.deny()
+            return
+        }
+
+        val unsupportedResources = request.resources.filter { it !in supportedResources }
+        if (unsupportedResources.isNotEmpty()) {
+            Log.w(TAG, "Ignoring unsupported WebView permission resources: ${unsupportedResources.joinToString()}")
+        }
+
+        val permissions = supportedResources
+            .flatMap { androidPermissionsForWebResource(it).orEmpty().asIterable() }
             .distinct()
             .toTypedArray()
         if (permissions.all { isPermissionGranted(it) }) {
-            request.grant(request.resources)
+            request.grant(supportedResources)
             return
         }
 
         pendingPermissionRequest?.deny()
         pendingPermissionRequest = request
-        pendingPermissionResources = request.resources
+        pendingPermissionResources = supportedResources
         webPermissionLauncher.launch(permissions)
     }
 
@@ -309,11 +494,13 @@ class MainActivity : ComponentActivity() {
             permission
         ) == PackageManager.PERMISSION_GRANTED
 
-    private fun androidPermissionsForWebResource(resource: String): Array<String> =
+    private fun androidPermissionsForWebResource(resource: String): Array<String>? =
         when (resource) {
             PermissionRequest.RESOURCE_AUDIO_CAPTURE -> arrayOf(Manifest.permission.RECORD_AUDIO)
             PermissionRequest.RESOURCE_VIDEO_CAPTURE -> arrayOf(Manifest.permission.CAMERA)
-            else -> emptyArray()
+            PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID -> emptyArray()
+            PermissionRequest.RESOURCE_MIDI_SYSEX -> null
+            else -> null
         }
 }
 
@@ -476,6 +663,16 @@ private fun WebView.configureLobeHubWebView(
             return handleExternalUri(context, view, uri)
         }
 
+        override fun shouldInterceptRequest(
+            view: WebView?,
+            request: WebResourceRequest?,
+        ): WebResourceResponse? {
+            request?.url?.let { uri ->
+                if (isTrustedAuthUrl(uri)) scheduleCookieFlush()
+            }
+            return super.shouldInterceptRequest(view, request)
+        }
+
         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
             super.onPageStarted(view, url, favicon)
             Log.d(TAG, "Loading $url")
@@ -614,6 +811,12 @@ private fun WebView.configureLobeHubWebView(
         if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
             WebSettingsCompat.setAlgorithmicDarkeningAllowed(this, false)
         }
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_AUTHENTICATION)) {
+            WebSettingsCompat.setWebAuthenticationSupport(
+                this,
+                WebSettingsCompat.WEB_AUTHENTICATION_SUPPORT_FOR_APP,
+            )
+        }
     }
 }
 
@@ -748,6 +951,12 @@ private fun browserLikeUserAgent(defaultUserAgent: String): String =
     defaultUserAgent
         .replace("; wv", "")
         .replace("Version/4.0 ", "")
+
+private fun scheduleCookieFlush() {
+    val handler = Handler(Looper.getMainLooper())
+    handler.postDelayed({ CookieManager.getInstance().flush() }, 1_000L)
+    handler.postDelayed({ CookieManager.getInstance().flush() }, 5_000L)
+}
 
 private val SPA_GO_BACK_SCRIPT = """
     (function () {
@@ -936,6 +1145,27 @@ private data class BlobDownload(
     val mimeType: String,
 )
 
+private enum class CaptureMediaType {
+    IMAGE,
+    VIDEO,
+    AUDIO,
+}
+
+private fun captureMediaTypeFor(acceptTypes: Array<String>): CaptureMediaType? {
+    val types = acceptTypes
+        .flatMap { it.split(',') }
+        .map { it.substringBefore(';').trim().lowercase(Locale.US) }
+        .filter { it.isNotBlank() }
+
+    if (types.isEmpty() || types.any { it == "*/*" }) return CaptureMediaType.IMAGE
+    return when {
+        types.any { it == "image/*" || it.startsWith("image/") } -> CaptureMediaType.IMAGE
+        types.any { it == "video/*" || it.startsWith("video/") } -> CaptureMediaType.VIDEO
+        types.any { it == "audio/*" || it.startsWith("audio/") } -> CaptureMediaType.AUDIO
+        else -> null
+    }
+}
+
 private fun guessDownloadFileName(
     url: String,
     contentDisposition: String?,
@@ -972,6 +1202,9 @@ private fun isTrustedWebUrl(url: String?): Boolean {
     val trustedHost = Uri.parse(WEBSITE).host ?: return false
     return host == trustedHost || host.endsWith(".$trustedHost")
 }
+
+private fun isTrustedAuthUrl(uri: Uri): Boolean =
+    isTrustedWebUrl(uri.toString()) && uri.path?.startsWith("/api/auth/") == true
 
 private val BLOB_DOWNLOAD_SCRIPT = """
     (function () {

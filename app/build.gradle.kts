@@ -77,6 +77,10 @@ dependencies {
     debugImplementation(libs.androidx.ui.tooling)
     // Core
     implementation(libs.androidx.core.ktx)
+    // WebAuthn / passkeys
+    implementation(libs.androidx.credentials)
+    implementation(libs.androidx.credentials.play.services.auth)
+    implementation(libs.androidx.fragment)
     // Webkit
     implementation(libs.androidx.webkit)
     // SplashScreen
