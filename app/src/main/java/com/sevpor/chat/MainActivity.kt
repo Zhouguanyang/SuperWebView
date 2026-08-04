@@ -3,6 +3,7 @@ package com.sevpor.chat
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.DownloadManager
 import android.content.ActivityNotFoundException
 import android.content.ClipData
@@ -14,6 +15,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.media.MediaScannerConnection
 import android.net.Uri
+import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -22,14 +24,21 @@ import android.os.Looper
 import android.os.Message
 import android.provider.MediaStore
 import android.util.Base64
+import android.util.Base64InputStream
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.text.InputType
+import android.security.KeyChain
+import android.webkit.ClientCertRequest
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
+import android.webkit.HttpAuthHandler
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -39,6 +48,8 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -53,6 +64,7 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -70,18 +82,24 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.sevpor.chat.ui.theme.SuperWebViewTheme
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.util.Locale
+import java.util.WeakHashMap
 
 private const val WEBSITE = "https://chat.sevpor.com"
 private const val TAG = "SevporWebView"
 private const val BLOB_DOWNLOAD_BRIDGE = "SevporBlobDownloader"
 private const val DEFAULT_DOWNLOAD_MIME_TYPE = "application/octet-stream"
 private const val EXIT_BACK_PRESS_INTERVAL_MS = 2_000L
+private const val BLOB_DOWNLOAD_CHUNK_BYTES = 256 * 1024
+private val webViewDownloadBridges = WeakHashMap<WebView, WebViewBridge>()
 
 class MainActivity : ComponentActivity() {
 
+    private val activeWebViews = linkedSetOf<WebView>()
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingFileChooserCaptureUri: Uri? = null
     private var pendingFileChooserCaptureFile: File? = null
@@ -91,6 +109,7 @@ class MainActivity : ComponentActivity() {
     private var pendingGeolocationOrigin: String? = null
     private var pendingGeolocationCallback: GeolocationPermissions.Callback? = null
     private var pendingBlobDownload: BlobDownload? = null
+    private var isActivityResumed = false
 
     private val fileChooserLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -177,6 +196,7 @@ class MainActivity : ComponentActivity() {
             if (granted) {
                 writeBlobDownload(download)
             } else {
+                download.tempFile.delete()
                 Toast.makeText(this, R.string.download_failed, Toast.LENGTH_SHORT).show()
             }
         }
@@ -202,13 +222,33 @@ class MainActivity : ComponentActivity() {
                         onPermissionRequest = ::requestWebPermission,
                         onGeolocationPermissionRequest = ::requestGeolocationPermission,
                         onBlobDownload = ::saveBlobDownload,
+                        onWebViewCreated = ::registerWebView,
+                        onWebViewDestroyed = ::unregisterWebView,
                     )
                 }
             }
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        isActivityResumed = true
+        activeWebViews.toList().forEach { webView ->
+            runCatching {
+                webView.onResume()
+                webView.resumeTimers()
+            }.onFailure { Log.w(TAG, "Unable to resume WebView", it) }
+        }
+    }
+
     override fun onPause() {
+        activeWebViews.toList().forEach { webView ->
+            runCatching {
+                webView.onPause()
+                webView.pauseTimers()
+            }.onFailure { Log.w(TAG, "Unable to pause WebView", it) }
+        }
+        isActivityResumed = false
         CookieManager.getInstance().flush()
         super.onPause()
     }
@@ -233,8 +273,27 @@ class MainActivity : ComponentActivity() {
         }
         pendingGeolocationOrigin = null
         pendingGeolocationCallback = null
+        pendingBlobDownload?.tempFile?.delete()
         pendingBlobDownload = null
+        activeWebViews.toList().forEach { webView ->
+            unregisterWebView(webView)
+            webView.destroySafely()
+        }
         super.onDestroy()
+    }
+
+    private fun registerWebView(webView: WebView) {
+        activeWebViews += webView
+        if (isActivityResumed) {
+            runCatching {
+                webView.onResume()
+                webView.resumeTimers()
+            }.onFailure { Log.w(TAG, "Unable to resume registered WebView", it) }
+        }
+    }
+
+    private fun unregisterWebView(webView: WebView?) {
+        if (webView != null) activeWebViews.remove(webView)
     }
 
     private fun showFileChooser(
@@ -447,6 +506,8 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Unable to save blob download", e)
             Toast.makeText(this, R.string.download_failed, Toast.LENGTH_SHORT).show()
+        } finally {
+            download.tempFile.delete()
         }
     }
 
@@ -462,7 +523,9 @@ class MainActivity : ComponentActivity() {
             ?: error("Unable to create MediaStore download item")
 
         resolver.openOutputStream(uri)?.use { output ->
-            output.write(download.bytes)
+            download.tempFile.inputStream().use { input ->
+                input.copyTo(output)
+            }
         } ?: error("Unable to open MediaStore download stream")
 
         values.clear()
@@ -478,7 +541,9 @@ class MainActivity : ComponentActivity() {
         }
         val file = uniqueDownloadFile(downloadsDir, download.fileName)
         FileOutputStream(file).use { output ->
-            output.write(download.bytes)
+            download.tempFile.inputStream().use { input ->
+                input.copyTo(output)
+            }
         }
         MediaScannerConnection.scanFile(
             this,
@@ -510,6 +575,8 @@ private fun MainScreen(
     onPermissionRequest: (PermissionRequest) -> Unit,
     onGeolocationPermissionRequest: (String, GeolocationPermissions.Callback) -> Unit,
     onBlobDownload: (BlobDownload) -> Unit,
+    onWebViewCreated: (WebView) -> Unit,
+    onWebViewDestroyed: (WebView?) -> Unit,
 ) {
     var fullScreenView: View? by remember { mutableStateOf(null) }
     var popupWebView: WebView? by remember { mutableStateOf(null) }
@@ -518,15 +585,30 @@ private fun MainScreen(
         WebViewWithRefresher(
             modifier = Modifier.fillMaxSize(),
             onCustomViewChanged = { fullScreenView = it },
-            onPopupWebViewChanged = { popupWebView = it },
             onShowFileChooser = onShowFileChooser,
             onPermissionRequest = onPermissionRequest,
             onGeolocationPermissionRequest = onGeolocationPermissionRequest,
             onBlobDownload = onBlobDownload,
+            onWebViewCreated = onWebViewCreated,
+            onWebViewDestroyed = onWebViewDestroyed,
+            onPopupWebViewChanged = { nextPopup ->
+                val previousPopup = popupWebView
+                if (previousPopup != null && previousPopup !== nextPopup) {
+                    onWebViewDestroyed(previousPopup)
+                    previousPopup.destroySafely()
+                }
+                popupWebView = nextPopup
+            },
         )
 
         popupWebView?.let { popup ->
             key(popup) {
+                DisposableEffect(popup) {
+                    onDispose {
+                        onWebViewDestroyed(popup)
+                        popup.destroySafely()
+                    }
+                }
                 AndroidView(modifier = Modifier.fillMaxSize(), factory = { popup })
             }
         }
@@ -537,7 +619,8 @@ private fun MainScreen(
         if (popup.canGoBack()) {
             popup.goBack()
         } else {
-            popup.destroy()
+            onWebViewDestroyed(popup)
+            popup.destroySafely()
             popupWebView = null
         }
     }
@@ -552,14 +635,17 @@ private fun MainScreen(
 private fun WebViewWithRefresher(
     modifier: Modifier = Modifier,
     onCustomViewChanged: (View?) -> Unit,
-    onPopupWebViewChanged: (WebView?) -> Unit,
     onShowFileChooser: (ValueCallback<Array<Uri>>, WebChromeClient.FileChooserParams) -> Boolean,
     onPermissionRequest: (PermissionRequest) -> Unit,
     onGeolocationPermissionRequest: (String, GeolocationPermissions.Callback) -> Unit,
     onBlobDownload: (BlobDownload) -> Unit,
+    onWebViewCreated: (WebView) -> Unit,
+    onWebViewDestroyed: (WebView?) -> Unit,
+    onPopupWebViewChanged: (WebView?) -> Unit,
 ) {
     var webView: WebView? by remember { mutableStateOf(null) }
     val webViewId = remember { View.generateViewId() }
+    var webViewGeneration by remember { mutableStateOf(0) }
     var lastExitBackPressedAt by remember { mutableStateOf(0L) }
     var spaCanGoBack by remember { mutableStateOf(false) }
     val primaryColorArgb = MaterialTheme.colorScheme.primary.toArgb()
@@ -579,45 +665,75 @@ private fun WebViewWithRefresher(
         }
     }
 
-    AndroidView(modifier = modifier.fillMaxSize(), factory = { context ->
-        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
-
-        val swipeRefreshLayout = SwipeRefreshLayout(context).apply {
-            isEnabled = false
-            setBackgroundColor(backgroundColorArgb)
-            setColorSchemeColors(primaryColorArgb, secondaryColorArgb, tertiaryColorArgb)
+    key(webViewGeneration) {
+        DisposableEffect(webViewGeneration) {
+            onDispose {
+                val currentWebView = webView
+                if (currentWebView != null) {
+                    onWebViewDestroyed(currentWebView)
+                    currentWebView.destroySafely()
+                    if (webView === currentWebView) webView = null
+                }
+            }
         }
 
-        webView = WebView(context).apply {
-            id = webViewId
-            configureLobeHubWebView(
-                context = context,
-                backgroundColorArgb = backgroundColorArgb,
-                swipeRefreshLayout = swipeRefreshLayout,
-                onCustomViewChanged = onCustomViewChanged,
-                onPopupWebViewChanged = onPopupWebViewChanged,
-                onShowFileChooser = onShowFileChooser,
-                onPermissionRequest = onPermissionRequest,
-                onGeolocationPermissionRequest = onGeolocationPermissionRequest,
-                onBlobDownload = onBlobDownload,
-                onSpaCanGoBackChanged = { spaCanGoBack = it },
+        AndroidView(modifier = modifier.fillMaxSize(), factory = { context ->
+            WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+
+            val swipeRefreshLayout = SwipeRefreshLayout(context).apply {
+                isEnabled = false
+                setBackgroundColor(backgroundColorArgb)
+                setColorSchemeColors(primaryColorArgb, secondaryColorArgb, tertiaryColorArgb)
+            }
+
+            webView = WebView(context).apply {
+                id = webViewId
+                onWebViewCreated(this)
+                configureLobeHubWebView(
+                    context = context,
+                    backgroundColorArgb = backgroundColorArgb,
+                    swipeRefreshLayout = swipeRefreshLayout,
+                    onCustomViewChanged = onCustomViewChanged,
+                    onPopupWebViewChanged = onPopupWebViewChanged,
+                    onShowFileChooser = onShowFileChooser,
+                    onPermissionRequest = onPermissionRequest,
+                    onGeolocationPermissionRequest = onGeolocationPermissionRequest,
+                    onBlobDownload = onBlobDownload,
+                    onSpaCanGoBackChanged = { spaCanGoBack = it },
+                    onWebViewCreated = onWebViewCreated,
+                    onWebViewDestroyed = onWebViewDestroyed,
+                    onRenderProcessGone = { deadWebView ->
+                        onCustomViewChanged(null)
+                        if (deadWebView != null) {
+                            onWebViewDestroyed(deadWebView)
+                            deadWebView.destroySafely(afterRenderProcessGone = true)
+                        }
+                        if (deadWebView == null || deadWebView === webView) {
+                            webView = null
+                            spaCanGoBack = false
+                            webViewGeneration += 1
+                        } else {
+                            onPopupWebViewChanged(null)
+                        }
+                    },
+                )
+                loadUrl(WEBSITE)
+            }
+            swipeRefreshLayout.addView(
+                webView,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
             )
-            loadUrl(WEBSITE)
-        }
-        swipeRefreshLayout.addView(
-            webView,
-            ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        )
-        swipeRefreshLayout
-    }, update = { swipeRefreshLayout ->
-        val view = swipeRefreshLayout.findViewById<WebView>(webViewId)
-        swipeRefreshLayout.setBackgroundColor(backgroundColorArgb)
-        view?.setBackgroundColor(backgroundColorArgb)
-        webView = view
-    })
+            swipeRefreshLayout
+        }, update = { swipeRefreshLayout ->
+            val view = swipeRefreshLayout.findViewById<WebView>(webViewId)
+            swipeRefreshLayout.setBackgroundColor(backgroundColorArgb)
+            view?.setBackgroundColor(backgroundColorArgb)
+            webView = view
+        })
+    }
 }
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -632,6 +748,9 @@ private fun WebView.configureLobeHubWebView(
     onGeolocationPermissionRequest: (String, GeolocationPermissions.Callback) -> Unit,
     onBlobDownload: (BlobDownload) -> Unit,
     onSpaCanGoBackChanged: (Boolean) -> Unit,
+    onWebViewCreated: (WebView) -> Unit,
+    onWebViewDestroyed: (WebView?) -> Unit,
+    onRenderProcessGone: (WebView?) -> Unit,
 ) {
     setBackgroundColor(backgroundColorArgb)
     isFocusable = true
@@ -645,14 +764,14 @@ private fun WebView.configureLobeHubWebView(
         setAcceptCookie(true)
         setAcceptThirdPartyCookies(this@configureLobeHubWebView, true)
     }
-    addJavascriptInterface(
-        WebViewBridge(
-            currentUrl = { this@configureLobeHubWebView.url },
-            onBlobDownload = onBlobDownload,
-            onSpaCanGoBackChanged = onSpaCanGoBackChanged,
-        ),
-        BLOB_DOWNLOAD_BRIDGE,
+    val webViewBridge = WebViewBridge(
+        cacheDirectory = context.cacheDir,
+        currentUrl = { this@configureLobeHubWebView.url },
+        onBlobDownload = onBlobDownload,
+        onSpaCanGoBackChanged = onSpaCanGoBackChanged,
     )
+    webViewDownloadBridges[this] = webViewBridge
+    addJavascriptInterface(webViewBridge, BLOB_DOWNLOAD_BRIDGE)
 
     webViewClient = object : WebViewClient() {
         override fun shouldOverrideUrlLoading(
@@ -701,6 +820,46 @@ private fun WebView.configureLobeHubWebView(
                 swipeRefreshLayout?.isRefreshing = false
             }
         }
+
+        override fun onRenderProcessGone(
+            view: WebView?,
+            detail: RenderProcessGoneDetail?,
+        ): Boolean {
+            Log.e(
+                TAG,
+                "WebView renderer gone, didCrash=${detail?.didCrash()}, priority=${detail?.rendererPriorityAtExit()}"
+            )
+            swipeRefreshLayout?.isRefreshing = false
+            onRenderProcessGone(view)
+            return true
+        }
+
+        override fun onReceivedHttpAuthRequest(
+            view: WebView?,
+            handler: HttpAuthHandler?,
+            host: String?,
+            realm: String?,
+        ) {
+            if (handler == null) return
+            showHttpAuthDialog(context, view, handler, host, realm)
+        }
+
+        override fun onReceivedClientCertRequest(
+            view: WebView?,
+            request: ClientCertRequest?,
+        ) {
+            if (request == null) return
+            chooseClientCertificate(view?.context ?: context, request)
+        }
+
+        override fun onReceivedSslError(
+            view: WebView?,
+            handler: SslErrorHandler?,
+            error: SslError?,
+        ) {
+            if (handler == null) return
+            showSslErrorDialog(view?.context ?: context, handler, error)
+        }
     }
 
     webChromeClient = object : WebChromeClient() {
@@ -726,6 +885,7 @@ private fun WebView.configureLobeHubWebView(
         ): Boolean {
             val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
             val popup = WebView(view?.context ?: context).apply {
+                onWebViewCreated(this)
                 configureLobeHubWebView(
                     context = context,
                     backgroundColorArgb = backgroundColorArgb,
@@ -737,6 +897,9 @@ private fun WebView.configureLobeHubWebView(
                     onGeolocationPermissionRequest = onGeolocationPermissionRequest,
                     onBlobDownload = onBlobDownload,
                     onSpaCanGoBackChanged = {},
+                    onWebViewCreated = onWebViewCreated,
+                    onWebViewDestroyed = onWebViewDestroyed,
+                    onRenderProcessGone = onRenderProcessGone,
                 )
             }
             transport.webView = popup
@@ -747,7 +910,8 @@ private fun WebView.configureLobeHubWebView(
 
         override fun onCloseWindow(window: WebView?) {
             onPopupWebViewChanged(null)
-            window?.destroy()
+            onWebViewDestroyed(window)
+            window?.destroySafely()
         }
 
         override fun onShowFileChooser(
@@ -788,6 +952,7 @@ private fun WebView.configureLobeHubWebView(
             userAgent = userAgent,
             contentDisposition = contentDisposition,
             mimeType = mimeType,
+            onBlobDownload = onBlobDownload,
         )
     }
 
@@ -911,19 +1076,32 @@ private fun handleDownload(
     userAgent: String?,
     contentDisposition: String?,
     mimeType: String?,
+    onBlobDownload: (BlobDownload) -> Unit,
 ) {
-    val uri = Uri.parse(url)
-    if (uri.scheme == "blob") {
-        downloadBlobFromPage(webView, url, guessDownloadFileName(url, contentDisposition, mimeType))
+    val scheme = runCatching { Uri.parse(url).scheme?.lowercase(Locale.US) }.getOrNull()
+    if (scheme == "blob") {
+        downloadPageUrlFromPage(webView, url, guessDownloadFileName(url, contentDisposition, mimeType))
         return
     }
 
-    if (uri.scheme != "http" && uri.scheme != "https") {
+    if (scheme == "data") {
+        downloadDataUrl(
+            context = context,
+            dataUrl = url,
+            fileName = guessDownloadFileName("download", contentDisposition, mimeTypeFromDataUrl(url) ?: mimeType),
+            fallbackMimeType = mimeType,
+            onBlobDownload = onBlobDownload,
+        )
+        return
+    }
+
+    if (scheme != "http" && scheme != "https") {
         Log.w(TAG, "Unsupported WebView download URL: $url")
         Toast.makeText(context, R.string.download_not_supported, Toast.LENGTH_SHORT).show()
         return
     }
 
+    val uri = Uri.parse(url)
     val fileName = guessDownloadFileName(url, contentDisposition, mimeType)
     val request = DownloadManager.Request(uri).apply {
         setTitle(fileName)
@@ -956,6 +1134,256 @@ private fun scheduleCookieFlush() {
     val handler = Handler(Looper.getMainLooper())
     handler.postDelayed({ CookieManager.getInstance().flush() }, 1_000L)
     handler.postDelayed({ CookieManager.getInstance().flush() }, 5_000L)
+}
+
+private fun downloadDataUrl(
+    context: Context,
+    dataUrl: String,
+    fileName: String,
+    fallbackMimeType: String?,
+    onBlobDownload: (BlobDownload) -> Unit,
+) {
+    Thread {
+        try {
+            onBlobDownload(writeDataUrlToTempFile(context.cacheDir, dataUrl, fileName, fallbackMimeType))
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to save data URL download", e)
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(context, R.string.download_failed, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }.start()
+}
+
+private fun writeDataUrlToTempFile(
+    cacheDirectory: File,
+    dataUrl: String,
+    fileName: String,
+    fallbackMimeType: String?,
+): BlobDownload {
+    require(dataUrl.startsWith("data:", ignoreCase = true)) { "Not a data URL" }
+    val commaIndex = dataUrl.indexOf(',')
+    require(commaIndex >= 0) { "Invalid data URL" }
+
+    val metadata = dataUrl.substring(5, commaIndex)
+    val payload = dataUrl.substring(commaIndex + 1)
+    val mimeType = mimeTypeFromDataUrl(dataUrl)
+        ?: fallbackMimeType?.takeIf { it.isNotBlank() }
+        ?: DEFAULT_DOWNLOAD_MIME_TYPE
+    val tempFile = createTempDownloadFile(cacheDirectory)
+
+    try {
+        FileOutputStream(tempFile).use { output ->
+            if (metadata.split(';').any { it.equals("base64", ignoreCase = true) }) {
+                Base64InputStream(
+                    ByteArrayInputStream(payload.toByteArray(Charsets.US_ASCII)),
+                    Base64.DEFAULT,
+                ).use { input ->
+                    input.copyTo(output)
+                }
+            } else {
+                writePercentDecodedBytes(payload, output)
+            }
+        }
+    } catch (e: Exception) {
+        tempFile.delete()
+        throw e
+    }
+
+    return BlobDownload(
+        tempFile = tempFile,
+        fileName = sanitizeDownloadFileName(fileName),
+        mimeType = mimeType,
+    )
+}
+
+private fun writePercentDecodedBytes(payload: String, output: OutputStream) {
+    var index = 0
+    while (index < payload.length) {
+        val char = payload[index]
+        if (char == '%' && index + 2 < payload.length) {
+            val high = hexValue(payload[index + 1])
+            val low = hexValue(payload[index + 2])
+            if (high >= 0 && low >= 0) {
+                output.write((high shl 4) or low)
+                index += 3
+                continue
+            }
+        }
+
+        if (char.code <= 0x7F) {
+            output.write(char.code)
+        } else {
+            output.write(char.toString().toByteArray(Charsets.UTF_8))
+        }
+        index++
+    }
+}
+
+private fun hexValue(char: Char): Int =
+    when (char) {
+        in '0'..'9' -> char - '0'
+        in 'a'..'f' -> char - 'a' + 10
+        in 'A'..'F' -> char - 'A' + 10
+        else -> -1
+    }
+
+private fun createTempDownloadFile(cacheDirectory: File): File {
+    val directory = File(cacheDirectory, "webview-downloads")
+    if (!directory.exists() && !directory.mkdirs()) {
+        error("Unable to create temporary download directory")
+    }
+    return File.createTempFile("download_", ".tmp", directory)
+}
+
+private fun destroyWebViewSafely(webView: WebView?, afterRenderProcessGone: Boolean = false) {
+    if (webView == null) return
+    webViewDownloadBridges.remove(webView)?.cancelAllDownloads()
+    runCatching { (webView.parent as? ViewGroup)?.removeView(webView) }
+    if (!afterRenderProcessGone) {
+        runCatching { webView.stopLoading() }
+        runCatching { webView.loadUrl("about:blank") }
+    }
+    runCatching {
+        webView.removeJavascriptInterface(BLOB_DOWNLOAD_BRIDGE)
+        webView.webChromeClient = null
+        webView.webViewClient = WebViewClient()
+        webView.removeAllViews()
+        webView.destroy()
+    }.onFailure { Log.w(TAG, "Unable to destroy WebView", it) }
+}
+
+private fun WebView.destroySafely(afterRenderProcessGone: Boolean = false) {
+    destroyWebViewSafely(this, afterRenderProcessGone)
+}
+
+private fun showHttpAuthDialog(
+    context: Context,
+    webView: WebView?,
+    handler: HttpAuthHandler,
+    host: String?,
+    realm: String?,
+) {
+    val activity = context as? Activity
+    if (activity == null || activity.isFinishing) {
+        handler.cancel()
+        return
+    }
+
+    val savedCredentials = if (!host.isNullOrBlank() && !realm.isNullOrBlank()) {
+        @Suppress("DEPRECATION")
+        webView?.getHttpAuthUsernamePassword(host, realm)
+    } else {
+        null
+    }
+
+    val density = activity.resources.displayMetrics.density
+    val padding = (24 * density).toInt()
+    val usernameInput = EditText(activity).apply {
+        hint = activity.getString(R.string.http_auth_username_hint)
+        setSingleLine(true)
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_NORMAL
+        setText(savedCredentials?.getOrNull(0).orEmpty())
+    }
+    val passwordInput = EditText(activity).apply {
+        hint = activity.getString(R.string.http_auth_password_hint)
+        setSingleLine(true)
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        setText(savedCredentials?.getOrNull(1).orEmpty())
+    }
+    val container = LinearLayout(activity).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(padding, 0, padding, 0)
+        addView(usernameInput)
+        addView(passwordInput)
+    }
+
+    AlertDialog.Builder(activity)
+        .setTitle(R.string.http_auth_title)
+        .setMessage(activity.getString(R.string.http_auth_message, host.orEmpty(), realm.orEmpty()))
+        .setView(container)
+        .setPositiveButton(android.R.string.ok) { _, _ ->
+            val username = usernameInput.text.toString()
+            val password = passwordInput.text.toString()
+            if (!host.isNullOrBlank() && !realm.isNullOrBlank()) {
+                @Suppress("DEPRECATION")
+                webView?.setHttpAuthUsernamePassword(host, realm, username, password)
+            }
+            handler.proceed(username, password)
+        }
+        .setNegativeButton(android.R.string.cancel) { _, _ ->
+            handler.cancel()
+        }
+        .setOnCancelListener {
+            handler.cancel()
+        }
+        .show()
+}
+
+private fun chooseClientCertificate(context: Context, request: ClientCertRequest) {
+    val activity = context as? Activity
+    if (activity == null || activity.isFinishing) {
+        request.ignore()
+        return
+    }
+
+    KeyChain.choosePrivateKeyAlias(
+        activity,
+        { alias ->
+            if (alias.isNullOrBlank()) {
+                request.ignore()
+                return@choosePrivateKeyAlias
+            }
+
+            Thread {
+                try {
+                    val privateKey = KeyChain.getPrivateKey(activity, alias)
+                    val certificateChain = KeyChain.getCertificateChain(activity, alias)
+                    Handler(Looper.getMainLooper()).post {
+                        if (privateKey != null && certificateChain != null) {
+                            request.proceed(privateKey, certificateChain)
+                        } else {
+                            request.ignore()
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Unable to load client certificate", e)
+                    Handler(Looper.getMainLooper()).post { request.ignore() }
+                }
+            }.start()
+        },
+        request.keyTypes,
+        request.principals,
+        request.host,
+        request.port,
+        null,
+    )
+}
+
+private fun showSslErrorDialog(context: Context, handler: SslErrorHandler, error: SslError?) {
+    val activity = context as? Activity
+    if (activity == null || activity.isFinishing) {
+        handler.cancel()
+        return
+    }
+
+    Log.w(TAG, "SSL error ${error?.primaryError} for ${error?.url}")
+    Handler(Looper.getMainLooper()).post {
+        if (activity.isFinishing || activity.isDestroyed) {
+            handler.cancel()
+            return@post
+        }
+        AlertDialog.Builder(activity)
+            .setTitle(R.string.ssl_error_title)
+            .setMessage(activity.getString(R.string.ssl_error_message, error?.url.orEmpty()))
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                handler.cancel()
+            }
+            .setOnCancelListener {
+                handler.cancel()
+            }
+            .show()
+    }
 }
 
 private val SPA_GO_BACK_SCRIPT = """
@@ -1087,44 +1515,114 @@ private val SPA_NAVIGATION_BRIDGE_SCRIPT = """
     })();
 """.trimIndent()
 
-private fun downloadBlobFromPage(webView: WebView, blobUrl: String, fileName: String) {
+private fun downloadPageUrlFromPage(webView: WebView, pageUrl: String, fileName: String) {
     if (!isTrustedWebUrl(webView.url)) {
-        Log.w(TAG, "Blocked blob download from untrusted page: ${webView.url}")
+        Log.w(TAG, "Blocked page download from untrusted page: ${webView.url}")
         return
     }
-    val script = "window.__sevporDownloadBlobUrl && window.__sevporDownloadBlobUrl(" +
-        "${JSONObject.quote(blobUrl)}, ${JSONObject.quote(fileName)});"
+    val script = "window.__sevporDownloadPageUrl && window.__sevporDownloadPageUrl(" +
+        "${JSONObject.quote(pageUrl)}, ${JSONObject.quote(fileName)});"
     webView.evaluateJavascript(script, null)
 }
 
 private class WebViewBridge(
+    private val cacheDirectory: File,
     private val currentUrl: () -> String?,
     private val onBlobDownload: (BlobDownload) -> Unit,
     private val onSpaCanGoBackChanged: (Boolean) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val activeDownloads = mutableMapOf<String, BlobDownloadSession>()
 
     @JavascriptInterface
-    fun downloadBlob(base64Data: String?, mimeType: String?, fileName: String?) {
+    @Synchronized
+    fun beginDownload(id: String?, mimeType: String?, fileName: String?): Boolean {
         if (!isTrustedWebUrl(currentUrl())) {
-            Log.w(TAG, "Blocked blob download bridge call from untrusted page: ${currentUrl()}")
-            return
+            Log.w(TAG, "Blocked download bridge call from untrusted page: ${currentUrl()}")
+            return false
         }
-        if (base64Data.isNullOrBlank()) {
-            Log.w(TAG, "Blocked empty blob download")
-            return
+        if (id.isNullOrBlank()) return false
+
+        runCatching { activeDownloads.remove(id)?.close(deleteFile = true) }
+        return try {
+            val tempFile = createTempDownloadFile(cacheDirectory)
+            activeDownloads[id] = BlobDownloadSession(
+                tempFile = tempFile,
+                output = FileOutputStream(tempFile),
+                fileName = sanitizeDownloadFileName(fileName),
+                mimeType = mimeType?.takeIf { it.isNotBlank() } ?: DEFAULT_DOWNLOAD_MIME_TYPE,
+            )
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to begin page download", e)
+            false
         }
+    }
+
+    @JavascriptInterface
+    @Synchronized
+    fun appendDownloadChunk(id: String?, base64Data: String?): Boolean {
+        if (!isTrustedWebUrl(currentUrl())) {
+            cancelDownload(id)
+            Log.w(TAG, "Blocked download chunk from untrusted page: ${currentUrl()}")
+            return false
+        }
+        if (id.isNullOrBlank() || base64Data.isNullOrBlank()) return false
+        val session = activeDownloads[id] ?: return false
+
         try {
+            session.output.write(Base64.decode(base64Data, Base64.DEFAULT))
+            return true
+        } catch (e: IllegalArgumentException) {
+            Log.e(TAG, "Invalid download chunk", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to append download chunk", e)
+        }
+
+        activeDownloads.remove(id)?.close(deleteFile = true)
+        return false
+    }
+
+    @JavascriptInterface
+    @Synchronized
+    fun finishDownload(id: String?): Boolean {
+        if (!isTrustedWebUrl(currentUrl())) {
+            cancelDownload(id)
+            Log.w(TAG, "Blocked download finish from untrusted page: ${currentUrl()}")
+            return false
+        }
+        if (id.isNullOrBlank()) return false
+        val session = activeDownloads.remove(id) ?: return false
+
+        return try {
+            session.output.flush()
+            session.output.close()
             onBlobDownload(
                 BlobDownload(
-                    bytes = Base64.decode(base64Data, Base64.DEFAULT),
-                    fileName = sanitizeDownloadFileName(fileName),
-                    mimeType = mimeType?.takeIf { it.isNotBlank() } ?: DEFAULT_DOWNLOAD_MIME_TYPE,
+                    tempFile = session.tempFile,
+                    fileName = session.fileName,
+                    mimeType = session.mimeType,
                 )
             )
-        } catch (e: IllegalArgumentException) {
-            Log.e(TAG, "Invalid blob download data", e)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to finish page download", e)
+            session.close(deleteFile = true)
+            false
         }
+    }
+
+    @JavascriptInterface
+    @Synchronized
+    fun cancelDownload(id: String?) {
+        if (id.isNullOrBlank()) return
+        activeDownloads.remove(id)?.close(deleteFile = true)
+    }
+
+    @Synchronized
+    fun cancelAllDownloads() {
+        activeDownloads.values.forEach { it.close(deleteFile = true) }
+        activeDownloads.clear()
     }
 
     @JavascriptInterface
@@ -1140,10 +1638,22 @@ private class WebViewBridge(
 }
 
 private data class BlobDownload(
-    val bytes: ByteArray,
+    val tempFile: File,
     val fileName: String,
     val mimeType: String,
 )
+
+private data class BlobDownloadSession(
+    val tempFile: File,
+    val output: FileOutputStream,
+    val fileName: String,
+    val mimeType: String,
+) {
+    fun close(deleteFile: Boolean) {
+        runCatching { output.close() }
+        if (deleteFile) runCatching { tempFile.delete() }
+    }
+}
 
 private enum class CaptureMediaType {
     IMAGE,
@@ -1171,6 +1681,17 @@ private fun guessDownloadFileName(
     contentDisposition: String?,
     mimeType: String?,
 ): String = sanitizeDownloadFileName(URLUtil.guessFileName(url, contentDisposition, mimeType))
+
+private fun mimeTypeFromDataUrl(dataUrl: String): String? {
+    if (!dataUrl.startsWith("data:", ignoreCase = true)) return null
+    val commaIndex = dataUrl.indexOf(',')
+    if (commaIndex < 0) return null
+
+    return dataUrl.substring(5, commaIndex)
+        .split(';')
+        .firstOrNull { it.contains('/') }
+        ?.takeIf { it.isNotBlank() }
+}
 
 private fun sanitizeDownloadFileName(fileName: String?): String {
     val cleanName = fileName
@@ -1210,6 +1731,8 @@ private val BLOB_DOWNLOAD_SCRIPT = """
     (function () {
       if (window.__sevporBlobDownloadInstalled) return;
       window.__sevporBlobDownloadInstalled = true;
+      var CHUNK_BYTES = $BLOB_DOWNLOAD_CHUNK_BYTES;
+      var BYTE_STRING_BATCH = 32768;
 
       function fileNameFromAnchor(anchor) {
         var fileName = anchor.getAttribute('download') || '';
@@ -1217,41 +1740,138 @@ private val BLOB_DOWNLOAD_SCRIPT = """
         return fileName;
       }
 
-      function sendBlobDownload(blobUrl, fileName) {
-        return fetch(blobUrl)
+      function bridge() {
+        return window.$BLOB_DOWNLOAD_BRIDGE;
+      }
+
+      function nextDownloadId() {
+        return String(Date.now()) + '_' + String(Math.random()).slice(2);
+      }
+
+      function bytesToBase64(bytes) {
+        var binary = '';
+        for (var offset = 0; offset < bytes.length; offset += BYTE_STRING_BATCH) {
+          var batch = bytes.subarray(offset, offset + BYTE_STRING_BATCH);
+          binary += String.fromCharCode.apply(null, batch);
+        }
+        return btoa(binary);
+      }
+
+      function sendBytes(id, bytes) {
+        var nativeBridge = bridge();
+        for (var offset = 0; offset < bytes.length; offset += CHUNK_BYTES) {
+          var chunk = bytes.subarray(offset, offset + CHUNK_BYTES);
+          if (!nativeBridge.appendDownloadChunk(id, bytesToBase64(chunk))) {
+            throw new Error('Native download chunk rejected');
+          }
+        }
+      }
+
+      function blobSlice(blob, start, end) {
+        var slice = blob.slice || blob.webkitSlice || blob.mozSlice;
+        if (typeof slice !== 'function') {
+          throw new Error('Blob slicing unsupported');
+        }
+        return slice.call(blob, start, end);
+      }
+
+      function readBlobSlice(blob, start, end) {
+        return new Promise(function (resolve, reject) {
+          var reader = new FileReader();
+          reader.onload = function () {
+            resolve(reader.result);
+          };
+          reader.onerror = function () {
+            reject(reader.error || new Error('FileReader failed'));
+          };
+          reader.onabort = function () {
+            reject(new Error('FileReader aborted'));
+          };
+          reader.readAsArrayBuffer(blobSlice(blob, start, end));
+        });
+      }
+
+      function sendWithFileReader(id, blob) {
+        var offset = 0;
+        function readNext() {
+          if (offset >= blob.size) return Promise.resolve();
+          var end = Math.min(offset + CHUNK_BYTES, blob.size);
+          return readBlobSlice(blob, offset, end).then(function (buffer) {
+            sendBytes(id, new Uint8Array(buffer));
+            offset = end;
+            return readNext();
+          });
+        }
+        return readNext();
+      }
+
+      function sendStream(id, blob) {
+        if (blob.stream && window.ReadableStream) {
+          var reader = blob.stream().getReader();
+          function pump() {
+            return reader.read().then(function (result) {
+              if (result.done) return;
+              if (result.value) sendBytes(id, result.value);
+              return pump();
+            });
+          }
+          return pump();
+        }
+
+        if (typeof blob.arrayBuffer === 'function') {
+          return blob.arrayBuffer().then(function (buffer) {
+            sendBytes(id, new Uint8Array(buffer));
+          });
+        }
+
+        return sendWithFileReader(id, blob);
+      }
+
+      function sendPageDownload(pageUrl, fileName) {
+        return fetch(pageUrl)
           .then(function (response) {
             return response.blob();
           })
           .then(function (blob) {
-            var reader = new FileReader();
-            reader.onloadend = function () {
-              var result = String(reader.result || '');
-              var commaIndex = result.indexOf(',');
-              var base64Data = commaIndex >= 0 ? result.substring(commaIndex + 1) : '';
-              window.$BLOB_DOWNLOAD_BRIDGE.downloadBlob(
-                base64Data,
-                blob.type || '$DEFAULT_DOWNLOAD_MIME_TYPE',
-                fileName || 'download'
-              );
-            };
-            reader.readAsDataURL(blob);
+            var id = nextDownloadId();
+            var nativeBridge = bridge();
+            if (!nativeBridge || typeof nativeBridge.beginDownload !== 'function') {
+              throw new Error('Native download bridge missing');
+            }
+            if (!nativeBridge.beginDownload(
+              id,
+              blob.type || '$DEFAULT_DOWNLOAD_MIME_TYPE',
+              fileName || 'download'
+            )) {
+              throw new Error('Native download rejected');
+            }
+            return sendStream(id, blob)
+              .then(function () {
+                nativeBridge.finishDownload(id);
+              })
+              .catch(function (error) {
+                nativeBridge.cancelDownload(id);
+                throw error;
+              });
           })
           .catch(function (error) {
-            console.error('Blob download failed', error);
+            console.error('Page download failed', error);
           });
       }
 
-      window.__sevporDownloadBlobUrl = sendBlobDownload;
+      window.__sevporDownloadPageUrl = sendPageDownload;
 
       document.addEventListener(
         'click',
         function (event) {
           var target = event.target;
           if (!target || !target.closest) return;
-          var anchor = target.closest('a[href^="blob:"]');
+          var anchor =
+            target.closest('a[href^="blob:"]') ||
+            target.closest('a[href^="data:"][download]');
           if (!anchor) return;
           event.preventDefault();
-          sendBlobDownload(anchor.href, fileNameFromAnchor(anchor));
+          sendPageDownload(anchor.href, fileNameFromAnchor(anchor));
         },
         true
       );

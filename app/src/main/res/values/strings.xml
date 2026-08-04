@@ -7,5 +7,11 @@
     <string name="download_started">Download started</string>
     <string name="download_failed">Download failed</string>
     <string name="download_not_supported">This download is not supported in WebView</string>
+    <string name="http_auth_title">Sign in required</string>
+    <string name="http_auth_message">%1$s %2$s</string>
+    <string name="http_auth_username_hint">Username</string>
+    <string name="http_auth_password_hint">Password</string>
+    <string name="ssl_error_title">Certificate error</string>
+    <string name="ssl_error_message">The secure connection to %1$s could not be verified.</string>
     <string name="press_back_again_to_exit">Press back again to exit</string>
 </resources>

@@ -7,5 +7,11 @@
     <string name="download_started">已开始下载</string>
     <string name="download_failed">下载失败</string>
     <string name="download_not_supported">WebView 不支持此下载</string>
+    <string name="http_auth_title">需要登录</string>
+    <string name="http_auth_message">%1$s %2$s</string>
+    <string name="http_auth_username_hint">用户名</string>
+    <string name="http_auth_password_hint">密码</string>
+    <string name="ssl_error_title">证书错误</string>
+    <string name="ssl_error_message">无法验证与 %1$s 的安全连接。</string>
     <string name="press_back_again_to_exit">再按一次返回桌面</string>
 </resources>
