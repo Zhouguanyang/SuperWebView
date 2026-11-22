@@ -83,6 +83,7 @@ class GeckoSessionController(
     private var attachedView: GeckoView? = null
     private var lastMainUrl: String? = WEBSITE
     private var lastPopupUrl: String? = null
+    private var hasLoadedMainPageOnce = false
     private var isStarted = false
     private var isResumed = false
     private var isClosed = false
@@ -164,7 +165,7 @@ class GeckoSessionController(
         val targetUrl = mainLoadError?.uri?.takeIf { it.isNotBlank() } ?: lastMainUrl ?: WEBSITE
         mainLoadError = null
         if (!mainSession.isOpen) {
-            mainSession.open(runtime)
+            mainSession.open(currentRuntime())
         }
         mainSession.loadUri(targetUrl)
         syncActiveState()
@@ -191,6 +192,28 @@ class GeckoSessionController(
     }
 
     fun navigateBackMain(onNoBackStack: () -> Unit) {
+        val currentError = mainLoadError
+        if (currentError != null) {
+            if (mainCanGoBack && mainSession.isOpen) {
+                mainLoadError = null
+                sevporNavCanGoBack = false
+                mainSession.goBack()
+                return
+            }
+            if (hasLoadedMainPageOnce && currentError.uri != lastMainUrl) {
+                mainLoadError = null
+                return
+            }
+            val homeTarget = lastMainUrl?.takeIf { it.isNotBlank() } ?: WEBSITE
+            if (currentError.uri != homeTarget && mainSession.isOpen) {
+                mainLoadError = null
+                mainSession.loadUri(homeTarget)
+                return
+            }
+            onNoBackStack()
+            return
+        }
+
         val fallback = {
             if (mainCanGoBack && mainSession.isOpen) {
                 mainLoadError = null
@@ -202,7 +225,7 @@ class GeckoSessionController(
         }
 
         val port = mainBridgePort
-        if (mainLoadError == null && sevporNavCanGoBack && port != null) {
+        if (sevporNavCanGoBack && port != null) {
             cancelPendingGoBack()
             val requestId = UUID.randomUUID().toString()
             pendingGoBackRequestId = requestId
@@ -478,7 +501,11 @@ class GeckoSessionController(
             }
 
             override fun onPageStop(session: GeckoSession, success: Boolean) {
-                if (!success) {
+                if (success) {
+                    if (!isPopup && session === mainSession) {
+                        hasLoadedMainPageOnce = true
+                    }
+                } else {
                     Log.w(TAG, "Page load stopped unsuccessfully (isPopup=$isPopup)")
                 }
             }
@@ -711,11 +738,14 @@ class GeckoSessionController(
         sevporNavCanGoBack = false
 
         if (!session.isOpen) {
-            session.open(runtime)
+            session.open(currentRuntime())
         }
         session.loadUri(lastMainUrl ?: WEBSITE)
         syncActiveState()
     }
+
+    private fun currentRuntime(): GeckoRuntime =
+        GeckoRuntimeHolder.getOrCreate(activity.applicationContext)
 
     private fun cancelPendingGoBack() {
         pendingGoBackTimeout?.let(mainHandler::removeCallbacks)

@@ -75,7 +75,7 @@ class GeckoPromptHandler(
             .setTitle(prompt.title.takeUnless { it.isNullOrBlank() })
             .setMessage(prompt.message.orEmpty())
             .setPositiveButton(android.R.string.ok) { _, _ ->
-                handle.completeOnce(prompt.dismiss())
+                handle.dismissOnce()
             }
             .create()
     }
@@ -88,10 +88,10 @@ class GeckoPromptHandler(
             .setTitle(prompt.title.takeUnless { it.isNullOrBlank() })
             .setMessage(prompt.message.orEmpty())
             .setPositiveButton(android.R.string.ok) { _, _ ->
-                handle.completeOnce(prompt.confirm(ButtonPrompt.Type.POSITIVE))
+                handle.completeOnce { prompt.confirm(ButtonPrompt.Type.POSITIVE) }
             }
             .setNegativeButton(android.R.string.cancel) { _, _ ->
-                handle.completeOnce(prompt.confirm(ButtonPrompt.Type.NEGATIVE))
+                handle.completeOnce { prompt.confirm(ButtonPrompt.Type.NEGATIVE) }
             }
             .create()
     }
@@ -112,10 +112,10 @@ class GeckoPromptHandler(
             .setMessage(prompt.message.takeUnless { it.isNullOrBlank() })
             .setView(container)
             .setPositiveButton(android.R.string.ok) { _, _ ->
-                handle.completeOnce(prompt.confirm(input.text.toString()))
+                handle.completeOnce { prompt.confirm(input.text.toString()) }
             }
             .setNegativeButton(android.R.string.cancel) { _, _ ->
-                handle.completeOnce(prompt.dismiss())
+                handle.dismissOnce()
             }
             .create()
     }
@@ -153,10 +153,10 @@ class GeckoPromptHandler(
                             .filterIndexed { index, item -> checked[index] && !item.choice.disabled }
                             .map { it.choice }
                             .toTypedArray()
-                        handle.completeOnce(prompt.confirm(selected))
+                        handle.completeOnce { prompt.confirm(selected) }
                     }
                     .setNegativeButton(android.R.string.cancel) { _, _ ->
-                        handle.completeOnce(prompt.dismiss())
+                        handle.dismissOnce()
                     }
             } else {
                 val selectedIndex = flattened.indexOfFirst { it.choice.selected }
@@ -170,11 +170,11 @@ class GeckoPromptHandler(
                             }
                             return@setSingleChoiceItems
                         }
-                        handle.completeOnce(prompt.confirm(choice))
+                        handle.completeOnce { prompt.confirm(choice) }
                         dialog.dismiss()
                     }
                     .setNegativeButton(android.R.string.cancel) { _, _ ->
-                        handle.completeOnce(prompt.dismiss())
+                        handle.dismissOnce()
                     }
             }
             builder.create()
@@ -188,82 +188,96 @@ class GeckoPromptHandler(
         if (!isActivityAlive()) return GeckoResult.fromValue(prompt.dismiss())
         val active = createActivePrompt(prompt)
 
-        when (prompt.type) {
-            DateTimePrompt.Type.DATE -> showDatePicker(prompt, active) { year, month, day ->
-                val formatted = String.format(Locale.US, "%04d-%02d-%02d", year, month + 1, day)
-                active.completeOnce(prompt.confirm(formatted))
-            }
-            DateTimePrompt.Type.TIME -> showTimePicker(prompt, active) { hour, minute ->
-                val formatted = String.format(Locale.US, "%02d:%02d", hour, minute)
-                active.completeOnce(prompt.confirm(formatted))
-            }
-            DateTimePrompt.Type.DATETIME_LOCAL -> {
-                val initial = parseDateTimeCalendar(prompt.defaultValue)
-                var proceedingToTime = false
-                val dateDialog = DatePickerDialog(
-                    activity,
-                    { _, year, month, day ->
-                        proceedingToTime = true
-                        val timeDialog = TimePickerDialog(
-                            activity,
-                            { _, hour, minute ->
-                                val formatted = String.format(
-                                    Locale.US,
-                                    "%04d-%02d-%02dT%02d:%02d",
-                                    year,
-                                    month + 1,
-                                    day,
-                                    hour,
-                                    minute,
+        try {
+            when (prompt.type) {
+                DateTimePrompt.Type.DATE -> showDatePicker(prompt, active) { year, month, day ->
+                    val formatted = String.format(Locale.US, "%04d-%02d-%02d", year, month + 1, day)
+                    active.completeOnce { prompt.confirm(formatted) }
+                }
+                DateTimePrompt.Type.TIME -> showTimePicker(prompt, active) { hour, minute ->
+                    val formatted = String.format(Locale.US, "%02d:%02d", hour, minute)
+                    active.completeOnce { prompt.confirm(formatted) }
+                }
+                DateTimePrompt.Type.DATETIME_LOCAL -> {
+                    val initial = parseDateTimeCalendar(prompt.defaultValue)
+                    var proceedingToTime = false
+                    val dateDialog = DatePickerDialog(
+                        activity,
+                        { _, year, month, day ->
+                            if (!isActivityAlive()) {
+                                active.dismissOnce()
+                                return@DatePickerDialog
+                            }
+                            proceedingToTime = true
+                            try {
+                                val timeDialog = TimePickerDialog(
+                                    activity,
+                                    { _, hour, minute ->
+                                        val formatted = String.format(
+                                            Locale.US,
+                                            "%04d-%02d-%02dT%02d:%02d",
+                                            year,
+                                            month + 1,
+                                            day,
+                                            hour,
+                                            minute,
+                                        )
+                                        active.completeOnce { prompt.confirm(formatted) }
+                                    },
+                                    initial.get(Calendar.HOUR_OF_DAY),
+                                    initial.get(Calendar.MINUTE),
+                                    true,
                                 )
-                                active.completeOnce(prompt.confirm(formatted))
-                            },
-                            initial.get(Calendar.HOUR_OF_DAY),
-                            initial.get(Calendar.MINUTE),
-                            true,
-                        )
-                        attachDialogLifecycle(timeDialog, active)
-                        timeDialog.show()
-                    },
-                    initial.get(Calendar.YEAR),
-                    initial.get(Calendar.MONTH),
-                    initial.get(Calendar.DAY_OF_MONTH),
-                )
-                applyDateBounds(dateDialog, prompt.minValue, prompt.maxValue)
-                active.dialog = dateDialog
-                dateDialog.setOnCancelListener { active.dismissOnce() }
-                dateDialog.setOnDismissListener {
-                    if (!proceedingToTime) active.dismissOnce()
-                }
-                dateDialog.show()
-            }
-            DateTimePrompt.Type.MONTH,
-            DateTimePrompt.Type.WEEK -> {
-                val hintRes = if (prompt.type == DateTimePrompt.Type.MONTH) {
-                    R.string.prompt_date_month_hint
-                } else {
-                    R.string.prompt_date_week_hint
-                }
-                val input = EditText(activity).apply {
-                    setSingleLine(true)
-                    hint = activity.getString(hintRes)
-                    setText(prompt.defaultValue.orEmpty())
-                    setSelection(text.length)
-                }
-                val dialog = AlertDialog.Builder(activity)
-                    .setTitle(prompt.title.takeUnless { it.isNullOrBlank() })
-                    .setView(createDialogInputContainer(input))
-                    .setPositiveButton(android.R.string.ok) { _, _ ->
-                        active.completeOnce(prompt.confirm(input.text.toString().trim()))
+                                attachDialogLifecycle(timeDialog, active)
+                                timeDialog.show()
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Unable to show time picker dialog", e)
+                                active.dismissOnce()
+                            }
+                        },
+                        initial.get(Calendar.YEAR),
+                        initial.get(Calendar.MONTH),
+                        initial.get(Calendar.DAY_OF_MONTH),
+                    )
+                    applyDateBounds(dateDialog, prompt.minValue, prompt.maxValue)
+                    active.dialog = dateDialog
+                    dateDialog.setOnCancelListener { active.dismissOnce() }
+                    dateDialog.setOnDismissListener {
+                        if (!proceedingToTime) active.dismissOnce()
                     }
-                    .setNegativeButton(android.R.string.cancel) { _, _ ->
-                        active.dismissOnce()
+                    dateDialog.show()
+                }
+                DateTimePrompt.Type.MONTH,
+                DateTimePrompt.Type.WEEK -> {
+                    val hintRes = if (prompt.type == DateTimePrompt.Type.MONTH) {
+                        R.string.prompt_date_month_hint
+                    } else {
+                        R.string.prompt_date_week_hint
                     }
-                    .create()
-                attachDialogLifecycle(dialog, active)
-                dialog.show()
+                    val input = EditText(activity).apply {
+                        setSingleLine(true)
+                        hint = activity.getString(hintRes)
+                        setText(prompt.defaultValue.orEmpty())
+                        setSelection(text.length)
+                    }
+                    val dialog = AlertDialog.Builder(activity)
+                        .setTitle(prompt.title.takeUnless { it.isNullOrBlank() })
+                        .setView(createDialogInputContainer(input))
+                        .setPositiveButton(android.R.string.ok) { _, _ ->
+                            active.completeOnce { prompt.confirm(input.text.toString().trim()) }
+                        }
+                        .setNegativeButton(android.R.string.cancel) { _, _ ->
+                            active.dismissOnce()
+                        }
+                        .create()
+                    attachDialogLifecycle(dialog, active)
+                    dialog.show()
+                }
+                else -> active.dismissOnce()
             }
-            else -> active.dismissOnce()
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to show date/time prompt dialog", e)
+            active.dismissOnce()
         }
 
         return active.result
@@ -339,7 +353,7 @@ class GeckoPromptHandler(
             .setPositiveButton(android.R.string.ok) { _, _ ->
                 val valid = normalizeHexColor(hexInput.text.toString())
                 if (valid != null) {
-                    handle.completeOnce(prompt.confirm(valid))
+                    handle.completeOnce { prompt.confirm(valid) }
                 } else {
                     handle.dismissOnce()
                 }
@@ -381,9 +395,9 @@ class GeckoPromptHandler(
             .setPositiveButton(android.R.string.ok) { _, _ ->
                 val password = passwordInput.text.toString()
                 if (onlyPassword) {
-                    handle.completeOnce(prompt.confirm(password))
+                    handle.completeOnce { prompt.confirm(password) }
                 } else {
-                    handle.completeOnce(prompt.confirm(usernameInput.text.toString(), password))
+                    handle.completeOnce { prompt.confirm(usernameInput.text.toString(), password) }
                 }
             }
             .setNegativeButton(android.R.string.cancel) { _, _ ->
@@ -405,10 +419,10 @@ class GeckoPromptHandler(
             .setTitle(R.string.prompt_folder_upload_title)
             .setMessage(activity.getString(R.string.prompt_folder_upload_message, prompt.directoryName))
             .setPositiveButton(R.string.prompt_upload) { _, _ ->
-                handle.completeOnce(prompt.confirm(AllowOrDeny.ALLOW))
+                handle.completeOnce { prompt.confirm(AllowOrDeny.ALLOW) }
             }
             .setNegativeButton(android.R.string.cancel) { _, _ ->
-                handle.completeOnce(prompt.confirm(AllowOrDeny.DENY))
+                handle.completeOnce { prompt.confirm(AllowOrDeny.DENY) }
             }
             .create()
     }
@@ -426,9 +440,9 @@ class GeckoPromptHandler(
                 { alias ->
                     mainHandler.post {
                         if (!alias.isNullOrBlank()) {
-                            active.completeOnce(request.confirm(alias))
+                            active.completeOnce { request.confirm(alias) }
                         } else {
-                            active.completeOnce(request.confirm(null))
+                            active.completeOnce { request.confirm(null) }
                         }
                     }
                 },
@@ -454,10 +468,10 @@ class GeckoPromptHandler(
             .setTitle(prompt.title.takeUnless { it.isNullOrBlank() } ?: activity.getString(R.string.prompt_before_unload_title))
             .setMessage(R.string.prompt_before_unload_message)
             .setPositiveButton(R.string.prompt_leave) { _, _ ->
-                handle.completeOnce(prompt.confirm(AllowOrDeny.ALLOW))
+                handle.completeOnce { prompt.confirm(AllowOrDeny.ALLOW) }
             }
             .setNegativeButton(android.R.string.cancel) { _, _ ->
-                handle.completeOnce(prompt.confirm(AllowOrDeny.DENY))
+                handle.completeOnce { prompt.confirm(AllowOrDeny.DENY) }
             }
             .create()
     }
@@ -470,10 +484,10 @@ class GeckoPromptHandler(
             .setTitle(prompt.title.takeUnless { it.isNullOrBlank() } ?: activity.getString(R.string.prompt_repost_title))
             .setMessage(R.string.prompt_repost_message)
             .setPositiveButton(R.string.prompt_resend) { _, _ ->
-                handle.completeOnce(prompt.confirm(AllowOrDeny.ALLOW))
+                handle.completeOnce { prompt.confirm(AllowOrDeny.ALLOW) }
             }
             .setNegativeButton(android.R.string.cancel) { _, _ ->
-                handle.completeOnce(prompt.confirm(AllowOrDeny.DENY))
+                handle.completeOnce { prompt.confirm(AllowOrDeny.DENY) }
             }
             .create()
     }
@@ -490,10 +504,10 @@ class GeckoPromptHandler(
                 .setTitle(R.string.prompt_popup_title)
                 .setMessage(activity.getString(R.string.prompt_allow_navigation_message, prompt.targetUri.orEmpty()))
                 .setPositiveButton(R.string.prompt_allow) { _, _ ->
-                    handle.completeOnce(prompt.confirm(AllowOrDeny.ALLOW))
+                    handle.completeOnce { prompt.confirm(AllowOrDeny.ALLOW) }
                 }
                 .setNegativeButton(android.R.string.cancel) { _, _ ->
-                    handle.completeOnce(prompt.confirm(AllowOrDeny.DENY))
+                    handle.completeOnce { prompt.confirm(AllowOrDeny.DENY) }
                 }
                 .create()
         }
@@ -511,10 +525,10 @@ class GeckoPromptHandler(
                 .setTitle(R.string.prompt_redirect_title)
                 .setMessage(activity.getString(R.string.prompt_allow_navigation_message, prompt.targetUri.orEmpty()))
                 .setPositiveButton(R.string.prompt_allow) { _, _ ->
-                    handle.completeOnce(prompt.confirm(AllowOrDeny.ALLOW))
+                    handle.completeOnce { prompt.confirm(AllowOrDeny.ALLOW) }
                 }
                 .setNegativeButton(android.R.string.cancel) { _, _ ->
-                    handle.completeOnce(prompt.confirm(AllowOrDeny.DENY))
+                    handle.completeOnce { prompt.confirm(AllowOrDeny.DENY) }
                 }
                 .create()
         }
@@ -721,15 +735,17 @@ class GeckoPromptHandler(
         var dialog: Dialog? = null
         private val completed = AtomicBoolean(false)
 
-        fun completeOnce(response: PromptResponse) {
+        fun completeOnce(buildResponse: () -> PromptResponse) {
             if (completed.compareAndSet(false, true)) {
                 onFinished(this)
-                result.complete(response)
+                if (!prompt.isComplete) {
+                    result.complete(buildResponse())
+                }
             }
         }
 
         fun dismissOnce() {
-            completeOnce(prompt.dismiss())
+            completeOnce { prompt.dismiss() }
         }
     }
 

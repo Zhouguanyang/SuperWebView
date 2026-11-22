@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Log
 import android.webkit.MimeTypeMap
 import androidx.core.content.ContextCompat
@@ -20,11 +21,13 @@ import org.mozilla.geckoview.GeckoSession.PromptDelegate.FilePrompt
 import org.mozilla.geckoview.GeckoSession.PromptDelegate.PromptInstanceDelegate
 import org.mozilla.geckoview.GeckoSession.PromptDelegate.PromptResponse
 import java.io.File
+import java.io.FileOutputStream
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 
-private const val CAPTURE_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000L
+private const val FILE_CHOOSER_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000L
 
 class FileChooserHandler(
     private val activity: Activity,
@@ -44,7 +47,7 @@ class FileChooserHandler(
     private var isCleanedUp = false
 
     init {
-        executeIoSafely { cleanupStaleCaptureFiles() }
+        executeIoSafely { cleanupStaleCacheFiles() }
     }
 
     fun handleFilePrompt(prompt: FilePrompt): GeckoResult<PromptResponse> {
@@ -58,7 +61,7 @@ class FileChooserHandler(
             override fun onPromptDismiss(basePrompt: BasePrompt) {
                 mainHandler.post {
                     if (pendingPrompt === prompt) {
-                        completePending(prompt.dismiss(), deleteCaptureFile = true)
+                        dismissPromptSafely(prompt, deleteCaptureFile = true)
                     }
                 }
             }
@@ -75,7 +78,7 @@ class FileChooserHandler(
                 if (pendingPrompt !== prompt) return@requestPermissions
                 val allGranted = capturePermissions.all { isPermissionGranted(it, grantResults) }
                 if (!allGranted) {
-                    completePending(prompt.dismiss(), deleteCaptureFile = true)
+                    dismissPromptSafely(prompt, deleteCaptureFile = true)
                     return@requestPermissions
                 }
                 launchPickerSafely(prompt, createFileChooserIntent(prompt))
@@ -91,38 +94,79 @@ class FileChooserHandler(
         val prompt = pendingPrompt ?: return
         try {
             if (resultCode != Activity.RESULT_OK) {
-                completePending(prompt.dismiss(), deleteCaptureFile = true)
+                dismissPromptSafely(prompt, deleteCaptureFile = true)
                 return
             }
 
             if (prompt.type == FilePrompt.Type.FOLDER) {
                 val treeUri = data?.data
                 if (treeUri == null) {
-                    completePending(prompt.dismiss(), deleteCaptureFile = true)
+                    dismissPromptSafely(prompt, deleteCaptureFile = true)
                     return
                 }
-                confirmPromptAsync(prompt, deleteCaptureFile = true) {
-                    prompt.confirm(appContext, treeUri)
-                }
+                // Folder prompts require the SAF treeUri directly so GeckoView can traverse it.
+                val response = if (!prompt.isComplete) prompt.confirm(appContext, treeUri) else null
+                completePending(response, deleteCaptureFile = true)
                 return
             }
 
-            val uris = parseSelectedFileUris(resultCode, data) ?: parseCaptureOutputUri(resultCode)
+            val selectedUris = parseSelectedFileUris(resultCode, data)
+            val captureFile = pendingCaptureFile
+            val uris = selectedUris ?: parseCaptureOutputUri(resultCode)
             if (uris.isNullOrEmpty()) {
-                completePending(prompt.dismiss(), deleteCaptureFile = true)
+                dismissPromptSafely(prompt, deleteCaptureFile = true)
                 return
             }
 
-            confirmPromptAsync(prompt, deleteCaptureFile = false) {
-                if (prompt.type == FilePrompt.Type.MULTIPLE) {
-                    prompt.confirm(appContext, uris)
+            // If this came directly from our local capture output file, pass file:// directly
+            // on the UI thread without any copy.
+            if (selectedUris == null && captureFile != null && captureFile.exists()) {
+                val fileUri = Uri.fromFile(captureFile)
+                val response = if (!prompt.isComplete) {
+                    if (prompt.type == FilePrompt.Type.MULTIPLE) {
+                        prompt.confirm(appContext, arrayOf(fileUri))
+                    } else {
+                        prompt.confirm(appContext, fileUri)
+                    }
                 } else {
-                    prompt.confirm(appContext, uris.first())
+                    null
                 }
+                completePending(response, deleteCaptureFile = false)
+                return
+            }
+
+            // Copy content:// URIs to temporary local files on a background IO thread first,
+            // then invoke BasePrompt.confirm() strictly on the UI thread using file:// URIs
+            // (which GeckoView resolves in O(1) without touching disk on the main thread).
+            val queued = executeIoSafely {
+                val stagedUris = stageUrisToLocalFiles(uris)
+                mainHandler.post {
+                    if (pendingPrompt !== prompt) return@post
+                    if (stagedUris.isEmpty()) {
+                        dismissPromptSafely(prompt, deleteCaptureFile = true)
+                        return@post
+                    }
+                    val response = try {
+                        if (prompt.isComplete) {
+                            null
+                        } else if (prompt.type == FilePrompt.Type.MULTIPLE) {
+                            prompt.confirm(appContext, stagedUris)
+                        } else {
+                            prompt.confirm(appContext, stagedUris.first())
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Unable to confirm selected files", e)
+                        if (!prompt.isComplete) prompt.dismiss() else null
+                    }
+                    completePending(response, deleteCaptureFile = false)
+                }
+            }
+            if (!queued && pendingPrompt === prompt) {
+                dismissPromptSafely(prompt, deleteCaptureFile = true)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Unable to parse selected files", e)
-            completePending(prompt.dismiss(), deleteCaptureFile = true)
+            dismissPromptSafely(prompt, deleteCaptureFile = true)
         }
     }
 
@@ -132,27 +176,73 @@ class FileChooserHandler(
         ioExecutor.shutdown()
     }
 
-    private fun confirmPromptAsync(
-        prompt: FilePrompt,
-        deleteCaptureFile: Boolean,
-        buildResponse: () -> PromptResponse,
-    ) {
-        val queued = executeIoSafely {
-            val response = try {
-                buildResponse()
-            } catch (e: Exception) {
-                Log.e(TAG, "Unable to confirm selected files", e)
-                prompt.dismiss()
+    private fun stageUrisToLocalFiles(uris: Array<Uri>): Array<Uri> {
+        val staged = mutableListOf<Uri>()
+        uris.forEach { uri ->
+            if (uri.scheme.equals("file", ignoreCase = true)) {
+                staged += uri
+                return@forEach
             }
-            mainHandler.post {
-                if (pendingPrompt === prompt) {
-                    completePending(response, deleteCaptureFile = deleteCaptureFile)
+            val copied = copyContentUriToTempFile(uri)
+            if (copied != null) {
+                staged += Uri.fromFile(copied)
+            } else {
+                // Fallback to original content:// URI if staging failed unexpectedly.
+                staged += uri
+            }
+        }
+        return staged.toTypedArray()
+    }
+
+    private fun copyContentUriToTempFile(uri: Uri): File? {
+        return try {
+            val resolver = appContext.contentResolver
+            val displayName = queryDisplayName(uri) ?: "upload"
+            val safeName = sanitizeUploadFileName(displayName)
+            val batchDir = File(appContext.cacheDir, "gecko-uploads/${UUID.randomUUID()}")
+            if (!batchDir.exists() && !batchDir.mkdirs()) {
+                return null
+            }
+            val target = File(batchDir, safeName)
+            resolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(target).use { output ->
+                    input.copyTo(output)
+                }
+            } ?: return null
+            target
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to stage content URI to cache: $uri", e)
+            null
+        }
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        return runCatching {
+            appContext.contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0 && cursor.moveToFirst()) {
+                    cursor.getString(index)?.takeIf { it.isNotBlank() }
+                } else {
+                    null
                 }
             }
-        }
-        if (!queued && pendingPrompt === prompt) {
-            completePending(prompt.dismiss(), deleteCaptureFile = true)
-        }
+        }.getOrNull() ?: uri.lastPathSegment?.substringAfterLast('/')
+    }
+
+    private fun sanitizeUploadFileName(raw: String): String {
+        val clean = raw
+            .substringAfterLast('/')
+            .replace(Regex("""[\\:*?"<>|]"""), "_")
+            .trim()
+            .takeIf { it.isNotEmpty() && it != "." && it != ".." }
+            ?: "upload"
+        return clean.take(180)
     }
 
     private fun executeIoSafely(block: () -> Unit): Boolean {
@@ -166,19 +256,24 @@ class FileChooserHandler(
         }
     }
 
-    private fun cleanupStaleCaptureFiles() {
-        val cutoff = System.currentTimeMillis() - CAPTURE_CACHE_MAX_AGE_MS
-        listOfNotNull(appContext.externalCacheDir, appContext.cacheDir)
-            .distinct()
-            .map { File(it, "gecko-captures") }
-            .filter { it.isDirectory }
-            .forEach { root ->
-                root.walkBottomUp().forEach { entry ->
-                    if (entry.isFile && entry.lastModified() < cutoff) {
-                        runCatching { entry.delete() }
-                    }
+    private fun cleanupStaleCacheFiles() {
+        val cutoff = System.currentTimeMillis() - FILE_CHOOSER_CACHE_MAX_AGE_MS
+        val roots = buildList {
+            appContext.externalCacheDir?.let { add(File(it, "gecko-captures")) }
+            add(File(appContext.cacheDir, "gecko-captures"))
+            add(File(appContext.cacheDir, "gecko-uploads"))
+        }.distinct()
+
+        roots.filter { it.isDirectory }.forEach { root ->
+            root.walkBottomUp().forEach { entry ->
+                if (entry == root) return@forEach
+                if (entry.isFile && entry.lastModified() < cutoff) {
+                    runCatching { entry.delete() }
+                } else if (entry.isDirectory && entry.listFiles().isNullOrEmpty() && entry.lastModified() < cutoff) {
+                    runCatching { entry.delete() }
                 }
             }
+        }
     }
 
     private fun launchPickerSafely(prompt: FilePrompt, intent: Intent) {
@@ -186,24 +281,31 @@ class FileChooserHandler(
             launchIntent(intent)
         } catch (e: ActivityNotFoundException) {
             Log.e(TAG, "No file chooser available", e)
-            completePending(prompt.dismiss(), deleteCaptureFile = true)
+            dismissPromptSafely(prompt, deleteCaptureFile = true)
         } catch (e: Exception) {
             Log.e(TAG, "Unable to launch file chooser", e)
-            completePending(prompt.dismiss(), deleteCaptureFile = true)
+            dismissPromptSafely(prompt, deleteCaptureFile = true)
         }
     }
 
     private fun dismissPendingPrompt() {
         val prompt = pendingPrompt ?: return
-        completePending(prompt.dismiss(), deleteCaptureFile = true)
+        dismissPromptSafely(prompt, deleteCaptureFile = true)
     }
 
-    private fun completePending(response: PromptResponse, deleteCaptureFile: Boolean) {
+    private fun dismissPromptSafely(prompt: FilePrompt, deleteCaptureFile: Boolean) {
+        val response = if (!prompt.isComplete) prompt.dismiss() else null
+        completePending(response, deleteCaptureFile = deleteCaptureFile)
+    }
+
+    private fun completePending(response: PromptResponse?, deleteCaptureFile: Boolean) {
         val result = pendingResult
         pendingPrompt = null
         pendingResult = null
         clearPendingCapture(deleteFile = deleteCaptureFile)
-        result?.complete(response)
+        if (response != null) {
+            result?.complete(response)
+        }
     }
 
     private fun createFolderChooserIntent(): Intent =

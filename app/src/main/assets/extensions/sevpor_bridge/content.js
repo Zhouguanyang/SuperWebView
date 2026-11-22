@@ -308,7 +308,7 @@
               return;
             }
           } catch (e) {}
-          return originalClick.apply(this, arguments);
+          return originalClick.call(this);
         },
         proto,
         { defineAs: 'click' }
