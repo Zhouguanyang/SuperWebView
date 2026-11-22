@@ -22,6 +22,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Base64
 import android.util.Base64InputStream
@@ -94,12 +95,17 @@ private const val TAG = "SevporWebView"
 private const val BLOB_DOWNLOAD_BRIDGE = "SevporBlobDownloader"
 private const val DEFAULT_DOWNLOAD_MIME_TYPE = "application/octet-stream"
 private const val EXIT_BACK_PRESS_INTERVAL_MS = 2_000L
+private const val FOREGROUND_RESUME_DISPATCH_DELAY_MS = 150L
+private const val SESSION_REFRESH_CHECK_INTERVAL_MS = 60 * 60 * 1_000L
 private const val BLOB_DOWNLOAD_CHUNK_BYTES = 256 * 1024
 private val webViewDownloadBridges = WeakHashMap<WebView, WebViewBridge>()
 
 class MainActivity : ComponentActivity() {
 
     private val activeWebViews = linkedSetOf<WebView>()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingForegroundResumeRunnable: Runnable? = null
+    private var pausedAtElapsedMs = 0L
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingFileChooserCaptureUri: Uri? = null
     private var pendingFileChooserCaptureFile: File? = null
@@ -233,19 +239,24 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         isActivityResumed = true
+        val wasPaused = pausedAtElapsedMs > 0L
+        pausedAtElapsedMs = 0L
         activeWebViews.toList().forEach { webView ->
             runCatching {
                 webView.onResume()
-                webView.resumeTimers()
             }.onFailure { Log.w(TAG, "Unable to resume WebView", it) }
+        }
+        if (wasPaused) {
+            scheduleForegroundResumeWakeup()
         }
     }
 
     override fun onPause() {
+        cancelPendingForegroundResumeWakeup()
+        pausedAtElapsedMs = SystemClock.elapsedRealtime()
         activeWebViews.toList().forEach { webView ->
             runCatching {
                 webView.onPause()
-                webView.pauseTimers()
             }.onFailure { Log.w(TAG, "Unable to pause WebView", it) }
         }
         isActivityResumed = false
@@ -259,6 +270,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        cancelPendingForegroundResumeWakeup()
         CookieManager.getInstance().flush()
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
@@ -282,12 +294,32 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    private fun scheduleForegroundResumeWakeup() {
+        cancelPendingForegroundResumeWakeup()
+        val runnable = Runnable {
+            pendingForegroundResumeRunnable = null
+            if (!isActivityResumed) return@Runnable
+            activeWebViews.toList().forEach { webView ->
+                if (!isTrustedWebUrl(webView.url)) return@forEach
+                runCatching {
+                    webView.evaluateJavascript(FOREGROUND_RESUME_WAKEUP_SCRIPT, null)
+                }.onFailure { Log.w(TAG, "Unable to dispatch foreground resume wakeup", it) }
+            }
+        }
+        pendingForegroundResumeRunnable = runnable
+        mainHandler.postDelayed(runnable, FOREGROUND_RESUME_DISPATCH_DELAY_MS)
+    }
+
+    private fun cancelPendingForegroundResumeWakeup() {
+        pendingForegroundResumeRunnable?.let(mainHandler::removeCallbacks)
+        pendingForegroundResumeRunnable = null
+    }
+
     private fun registerWebView(webView: WebView) {
         activeWebViews += webView
         if (isActivityResumed) {
             runCatching {
                 webView.onResume()
-                webView.resumeTimers()
             }.onFailure { Log.w(TAG, "Unable to resume registered WebView", it) }
         }
     }
@@ -803,6 +835,7 @@ private fun WebView.configureLobeHubWebView(
             if (isTrustedWebUrl(url)) {
                 view?.evaluateJavascript(BLOB_DOWNLOAD_SCRIPT, null)
                 view?.evaluateJavascript(SPA_NAVIGATION_BRIDGE_SCRIPT, null)
+                view?.evaluateJavascript(FOREGROUND_RESUME_BRIDGE_SCRIPT, null)
             } else {
                 onSpaCanGoBackChanged(false)
             }
@@ -1512,6 +1545,76 @@ private val SPA_NAVIGATION_BRIDGE_SCRIPT = """
       }
 
       syncCanGoBack();
+    })();
+""".trimIndent()
+
+private val FOREGROUND_RESUME_BRIDGE_SCRIPT = """
+    (function () {
+      if (window.__sevporForegroundBridgeInstalled) return;
+      window.__sevporForegroundBridgeInstalled = true;
+      window.__sevporLastVisibleAt = document.visibilityState === 'visible' ? Date.now() : 0;
+      window.__sevporLastSessionCheckAt = Date.now();
+      document.addEventListener(
+        'visibilitychange',
+        function () {
+          if (document.visibilityState === 'visible') {
+            window.__sevporLastVisibleAt = Date.now();
+          }
+        },
+        true
+      );
+    })();
+""".trimIndent()
+
+private val FOREGROUND_RESUME_WAKEUP_SCRIPT = """
+    (function () {
+      try {
+        var now = Date.now();
+        if (
+          document.visibilityState === 'visible' &&
+          now - (window.__sevporLastVisibleAt || 0) > 1000
+        ) {
+          window.__sevporLastVisibleAt = now;
+          document.dispatchEvent(new Event('visibilitychange'));
+        }
+
+        var SESSION_CHECK_INTERVAL_MS = $SESSION_REFRESH_CHECK_INTERVAL_MS;
+        if (
+          window.__sevporSessionRefreshInFlight ||
+          now - (window.__sevporLastSessionCheckAt || 0) < SESSION_CHECK_INTERVAL_MS
+        ) {
+          return;
+        }
+
+        window.__sevporSessionRefreshInFlight = true;
+        function clearInFlight() {
+          window.__sevporSessionRefreshInFlight = false;
+        }
+
+        fetch('/api/auth/get-session', {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store'
+        })
+          .then(function (response) {
+            if (!response.ok) return null;
+            window.__sevporLastSessionCheckAt = Date.now();
+            return response.json().catch(function () {
+              return null;
+            });
+          })
+          .then(function (data) {
+            if (data && data.needsRefresh === true) {
+              return fetch('/api/auth/get-session', {
+                method: 'POST',
+                credentials: 'include',
+                cache: 'no-store'
+              });
+            }
+          })
+          .catch(function () {})
+          .then(clearInFlight, clearInFlight);
+      } catch (e) {}
     })();
 """.trimIndent()
 
