@@ -124,10 +124,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         rejectAllPendingPermissions()
-        promptHandler.dismissAll()
-        fileChooserHandler.cleanup()
-        downloadHandler.cleanup()
-        sessionController.closeAll()
+        if (::promptHandler.isInitialized) promptHandler.dismissAll()
+        if (::fileChooserHandler.isInitialized) fileChooserHandler.cleanup()
+        if (::downloadHandler.isInitialized) downloadHandler.cleanup()
+        if (::sessionController.isInitialized) sessionController.closeAll()
         super.onDestroy()
     }
 

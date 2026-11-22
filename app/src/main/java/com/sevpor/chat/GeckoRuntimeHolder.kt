@@ -92,26 +92,23 @@ object GeckoRuntimeHolder {
             return
         }
 
-        val currentRuntime = synchronized(this) {
+        val immediateResult: Pair<Boolean, WebExtension?> = synchronized(this) {
             builtInExtension?.let { ext ->
-                runOnMain { callback(ext) }
-                return
+                return@synchronized true to ext
+            }
+            val currentRuntime = runtime
+            if (currentRuntime == null) {
+                return@synchronized true to null
             }
             extensionCallbacks += callback
-            runtime
+            if (!extensionInstallStarted) {
+                ensureBuiltInExtensionLocked(currentRuntime)
+            }
+            false to null
         }
 
-        if (currentRuntime != null) {
-            synchronized(this) {
-                if (!extensionInstallStarted) {
-                    ensureBuiltInExtensionLocked(currentRuntime)
-                }
-            }
-        } else {
-            val removed = synchronized(this) { extensionCallbacks.remove(callback) }
-            if (removed) {
-                runOnMain { callback(null) }
-            }
+        if (immediateResult.first) {
+            runOnMain { callback(immediateResult.second) }
         }
     }
 
@@ -135,6 +132,7 @@ object GeckoRuntimeHolder {
                         if (extension == null) {
                             Log.e(TAG, "Built-in extension returned null")
                             val pending = synchronized(this) {
+                                if (runtime !== geckoRuntime) return@synchronized emptyList()
                                 extensionInstallStarted = false
                                 val list = extensionCallbacks.toList()
                                 extensionCallbacks.clear()
@@ -144,6 +142,7 @@ object GeckoRuntimeHolder {
                             return@accept
                         }
                         val pending = synchronized(this) {
+                            if (runtime !== geckoRuntime) return@synchronized emptyList()
                             builtInExtension = extension
                             val list = extensionCallbacks.toList()
                             extensionCallbacks.clear()
@@ -154,6 +153,7 @@ object GeckoRuntimeHolder {
                     { error ->
                         Log.e(TAG, "Failed to install built-in extension", error)
                         val pending = synchronized(this) {
+                            if (runtime !== geckoRuntime) return@synchronized emptyList()
                             extensionInstallStarted = false
                             val list = extensionCallbacks.toList()
                             extensionCallbacks.clear()

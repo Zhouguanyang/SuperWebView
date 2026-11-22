@@ -14,6 +14,7 @@ import android.provider.MediaStore
 import android.util.Base64
 import android.util.Base64InputStream
 import android.util.Log
+import android.webkit.MimeTypeMap
 import android.webkit.URLUtil
 import android.widget.Toast
 import androidx.core.content.ContextCompat
@@ -57,13 +58,15 @@ class DownloadHandler(
         val scheme = runCatching { Uri.parse(url).scheme?.lowercase(Locale.US) }.getOrNull()
         val contentDisposition = response.headerIgnoreCase("content-disposition")
         val contentType = response.headerIgnoreCase("content-type")
-            ?.substringBefore(';')
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-        val fileName = guessDownloadFileName(
-            url = if (scheme == "data") "download" else url,
-            contentDisposition = contentDisposition,
-            mimeType = contentType ?: mimeTypeFromDataUrl(url),
+            ?.let(::normalizeDownloadMimeTypeOrNull)
+        val effectiveMimeType = contentType ?: mimeTypeFromDataUrl(url)
+        val fileName = ensureDownloadExtension(
+            fileName = guessDownloadFileName(
+                url = if (scheme == "data") "download" else url,
+                contentDisposition = contentDisposition,
+                mimeType = effectiveMimeType,
+            ),
+            mimeType = effectiveMimeType,
         )
         val body = response.body
 
@@ -86,7 +89,7 @@ class DownloadHandler(
                         PendingDownload(
                             tempFile = tempFile,
                             fileName = fileName,
-                            mimeType = contentType ?: DEFAULT_DOWNLOAD_MIME_TYPE,
+                            mimeType = effectiveMimeType ?: DEFAULT_DOWNLOAD_MIME_TYPE,
                         ),
                     )
                 } catch (e: Exception) {
@@ -138,12 +141,17 @@ class DownloadHandler(
         if (isCleanedUp || id.isNullOrBlank()) return false
         runCatching { activeBlobDownloads.remove(id)?.close(deleteFile = true) }
         return try {
+            val normalizedMimeType = normalizeDownloadMimeType(mimeType)
+            val resolvedFileName = ensureDownloadExtension(
+                fileName = sanitizeDownloadFileName(fileName),
+                mimeType = normalizedMimeType,
+            )
             val tempFile = createTempDownloadFile(appContext.cacheDir)
             activeBlobDownloads[id] = BlobDownloadSession(
                 tempFile = tempFile,
                 output = FileOutputStream(tempFile),
-                fileName = sanitizeDownloadFileName(fileName),
-                mimeType = mimeType?.takeIf { it.isNotBlank() } ?: DEFAULT_DOWNLOAD_MIME_TYPE,
+                fileName = resolvedFileName,
+                mimeType = normalizedMimeType,
             )
             showToast(R.string.download_started)
             true
@@ -404,7 +412,7 @@ class DownloadHandler(
         val metadata = dataUrl.substring(5, commaIndex)
         val payload = dataUrl.substring(commaIndex + 1)
         val mimeType = mimeTypeFromDataUrl(dataUrl)
-            ?: fallbackMimeType?.takeIf { it.isNotBlank() }
+            ?: normalizeDownloadMimeTypeOrNull(fallbackMimeType)
             ?: DEFAULT_DOWNLOAD_MIME_TYPE
         val tempFile = createTempDownloadFile(cacheDirectory)
 
@@ -428,7 +436,7 @@ class DownloadHandler(
 
         return PendingDownload(
             tempFile = tempFile,
-            fileName = sanitizeDownloadFileName(fileName),
+            fileName = ensureDownloadExtension(sanitizeDownloadFileName(fileName), mimeType),
             mimeType = mimeType,
         )
     }
@@ -567,7 +575,33 @@ private fun mimeTypeFromDataUrl(dataUrl: String): String? {
     return dataUrl.substring(5, commaIndex)
         .split(';')
         .firstOrNull { it.contains('/') }
+        ?.let(::normalizeDownloadMimeTypeOrNull)
+}
+
+private fun normalizeDownloadMimeTypeOrNull(raw: String?): String? {
+    val candidate = raw
+        ?.substringBefore(';')
+        ?.trim()
+        ?.lowercase(Locale.US)
+        ?: return null
+    if (!Regex("""^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$""").matches(candidate)) {
+        return null
+    }
+    return candidate
+}
+
+private fun normalizeDownloadMimeType(raw: String?): String =
+    normalizeDownloadMimeTypeOrNull(raw) ?: DEFAULT_DOWNLOAD_MIME_TYPE
+
+private fun ensureDownloadExtension(fileName: String, mimeType: String?): String {
+    if (fileName.contains('.')) return fileName
+    val normalizedMime = normalizeDownloadMimeTypeOrNull(mimeType) ?: return fileName
+    if (normalizedMime == DEFAULT_DOWNLOAD_MIME_TYPE) return fileName
+    val extension = MimeTypeMap.getSingleton()
+        .getExtensionFromMimeType(normalizedMime)
         ?.takeIf { it.isNotBlank() }
+        ?: return fileName
+    return "$fileName.$extension".take(180)
 }
 
 private fun sanitizeDownloadFileName(fileName: String?): String {

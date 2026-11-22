@@ -81,6 +81,17 @@
     });
   }
 
+  function pageFetch(url, init) {
+    if (typeof content !== 'undefined' && typeof content.fetch === 'function') {
+      if (init !== undefined) {
+        var safeInit = typeof cloneInto === 'function' ? cloneInto(init, window) : init;
+        return content.fetch(url, safeInit);
+      }
+      return content.fetch(url);
+    }
+    return init !== undefined ? window.fetch(url, init) : window.fetch(url);
+  }
+
   function handleForegroundResume() {
     try {
       var now = Date.now();
@@ -104,7 +115,7 @@
         sessionRefreshInFlight = false;
       }
 
-      fetch('/api/auth/get-session', {
+      pageFetch('/api/auth/get-session', {
         method: 'GET',
         credentials: 'include',
         cache: 'no-store'
@@ -118,7 +129,7 @@
         })
         .then(function (data) {
           if (data && data.needsRefresh === true) {
-            return fetch('/api/auth/get-session', {
+            return pageFetch('/api/auth/get-session', {
               method: 'POST',
               credentials: 'include',
               cache: 'no-store'
@@ -176,7 +187,8 @@
     }
   }
 
-  function sendBytes(id, bytes) {
+  function sendBytes(id, rawBytes) {
+    var bytes = rawBytes instanceof Uint8Array ? rawBytes : new Uint8Array(rawBytes);
     var chain = Promise.resolve();
     for (var offset = 0; offset < bytes.length; offset += CHUNK_BYTES) {
       (function (chunk) {
@@ -238,8 +250,11 @@
   function sendPageDownload(pageUrl, fileName) {
     var id = nextDownloadId();
     var started = false;
-    return fetch(pageUrl)
+    return pageFetch(pageUrl)
       .then(function (response) {
+        if (!response.ok) {
+          throw new Error('HTTP ' + response.status);
+        }
         return response.blob();
       })
       .then(function (blob) {

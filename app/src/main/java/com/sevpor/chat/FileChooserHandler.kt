@@ -119,8 +119,12 @@ class FileChooserHandler(
             }
 
             // If this came directly from our local capture output file, pass file:// directly
-            // on the UI thread without any copy.
-            if (selectedUris == null && captureFile != null && captureFile.exists()) {
+            // on the UI thread without any copy (also handle camera apps that echo pendingCaptureUri).
+            val isDirectCaptureResult =
+                captureFile != null &&
+                    captureFile.exists() &&
+                    (selectedUris == null || (selectedUris.size == 1 && selectedUris[0] == pendingCaptureUri))
+            if (isDirectCaptureResult) {
                 val fileUri = Uri.fromFile(captureFile)
                 val response = if (!prompt.isComplete) {
                     if (prompt.type == FilePrompt.Type.MULTIPLE) {
@@ -195,23 +199,31 @@ class FileChooserHandler(
     }
 
     private fun copyContentUriToTempFile(uri: Uri): File? {
+        var batchDir: File? = null
         return try {
             val resolver = appContext.contentResolver
             val displayName = queryDisplayName(uri) ?: "upload"
             val safeName = sanitizeUploadFileName(displayName)
-            val batchDir = File(appContext.cacheDir, "gecko-uploads/${UUID.randomUUID()}")
-            if (!batchDir.exists() && !batchDir.mkdirs()) {
+            val dir = File(appContext.cacheDir, "gecko-uploads/${UUID.randomUUID()}")
+            if (!dir.exists() && !dir.mkdirs()) {
                 return null
             }
-            val target = File(batchDir, safeName)
-            resolver.openInputStream(uri)?.use { input ->
+            batchDir = dir
+            val target = File(dir, safeName)
+            val stream = resolver.openInputStream(uri)
+            if (stream == null) {
+                runCatching { dir.deleteRecursively() }
+                return null
+            }
+            stream.use { input ->
                 FileOutputStream(target).use { output ->
                     input.copyTo(output)
                 }
-            } ?: return null
+            }
             target
         } catch (e: Exception) {
             Log.w(TAG, "Unable to stage content URI to cache: $uri", e)
+            runCatching { batchDir?.deleteRecursively() }
             null
         }
     }

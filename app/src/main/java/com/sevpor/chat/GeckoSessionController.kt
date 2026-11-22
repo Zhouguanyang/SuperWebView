@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -166,6 +167,7 @@ class GeckoSessionController(
         mainLoadError = null
         if (!mainSession.isOpen) {
             mainSession.open(currentRuntime())
+            attachBuiltInExtensionBridge(mainSession, isPopup = false)
         }
         mainSession.loadUri(targetUrl)
         syncActiveState()
@@ -441,6 +443,18 @@ class GeckoSessionController(
                         category = error.category,
                         code = error.code,
                     )
+                } else if (
+                    isPopup &&
+                    session === popupSession &&
+                    error.category != WebRequestError.ERROR_CATEGORY_SECURITY
+                ) {
+                    mainHandler.post {
+                        Toast.makeText(
+                            activity.applicationContext,
+                            R.string.error_message,
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
                 }
                 return null
             }
@@ -467,6 +481,8 @@ class GeckoSessionController(
             }
 
             override fun onFullScreen(session: GeckoSession, fullScreen: Boolean) {
+                val isActiveSession = if (isPopup) session === popupSession else popupSession == null
+                if (!isActiveSession) return
                 isFullScreen = fullScreen
                 onFullScreenChanged(fullScreen)
             }
@@ -739,6 +755,7 @@ class GeckoSessionController(
 
         if (!session.isOpen) {
             session.open(currentRuntime())
+            attachBuiltInExtensionBridge(session, isPopup = false)
         }
         session.loadUri(lastMainUrl ?: WEBSITE)
         syncActiveState()

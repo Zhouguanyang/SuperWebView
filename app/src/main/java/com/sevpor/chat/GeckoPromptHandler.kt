@@ -709,8 +709,13 @@ class GeckoPromptHandler(
     }
 
     private fun applyDateBounds(dialog: DatePickerDialog, minValue: String?, maxValue: String?) {
-        parseDateMillis(minValue)?.let { dialog.datePicker.minDate = it }
-        parseDateMillis(maxValue)?.let { dialog.datePicker.maxDate = it }
+        val minMillis = parseDateMillis(minValue)
+        val maxMillis = parseDateMillis(maxValue)
+        if (minMillis != null && maxMillis != null && minMillis > maxMillis) return
+        runCatching {
+            minMillis?.let { dialog.datePicker.minDate = it }
+            maxMillis?.let { dialog.datePicker.maxDate = it }
+        }
     }
 
     private fun parseDateMillis(value: String?): Long? {
