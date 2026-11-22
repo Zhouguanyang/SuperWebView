@@ -4,8 +4,7 @@
 
   var NATIVE_APP = 'sevpor_bridge';
   var DEFAULT_MIME_TYPE = 'application/octet-stream';
-  var CHUNK_BYTES = 256 * 1024;
-  var BYTE_STRING_BATCH = 32768;
+  var CHUNK_BYTES = 255 * 1024;
   var SESSION_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
   var port = null;
@@ -123,7 +122,10 @@
         .then(function (response) {
           if (!response.ok) return null;
           lastSessionCheckAt = Date.now();
-          return response.json().catch(function () {
+          return response.text().then(function (text) {
+            if (!text) return null;
+            return JSON.parse(text);
+          }).catch(function () {
             return null;
           });
         })
@@ -168,15 +170,6 @@
     return String(Date.now()) + '_' + String(Math.random()).slice(2);
   }
 
-  function bytesToBase64(bytes) {
-    var binary = '';
-    for (var offset = 0; offset < bytes.length; offset += BYTE_STRING_BATCH) {
-      var batch = bytes.subarray(offset, offset + BYTE_STRING_BATCH);
-      binary += String.fromCharCode.apply(null, batch);
-    }
-    return btoa(binary);
-  }
-
   function sendNative(payload) {
     return browser.runtime.sendNativeMessage(NATIVE_APP, payload);
   }
@@ -187,30 +180,26 @@
     }
   }
 
-  function sendBytes(id, rawBytes) {
-    var bytes = rawBytes instanceof Uint8Array ? rawBytes : new Uint8Array(rawBytes);
-    var chain = Promise.resolve();
-    for (var offset = 0; offset < bytes.length; offset += CHUNK_BYTES) {
-      (function (chunk) {
-        chain = chain.then(function () {
-          return sendNative({
-            type: 'appendDownloadChunk',
-            id: id,
-            data: bytesToBase64(chunk)
-          }).then(function (response) {
-            assertOk(response, 'Native download chunk rejected');
-          });
-        });
-      })(bytes.subarray(offset, offset + CHUNK_BYTES));
-    }
-    return chain;
-  }
-
-  function readBlobSlice(blob, start, end) {
+  // Read each Blob slice through the content script's own FileReader.readAsDataURL so
+  // Gecko encodes base64 natively and returns a primitive string, avoiding Firefox MV2
+  // Xray issues with page-compartment ReadableStream/Uint8Array objects from content.fetch.
+  function readBlobSliceAsBase64(blob, start, end) {
     return new Promise(function (resolve, reject) {
       var reader = new FileReader();
       reader.onload = function () {
-        resolve(reader.result);
+        var dataUrl = typeof reader.result === 'string' ? reader.result : '';
+        var marker = ';base64,';
+        var markerIndex = dataUrl.indexOf(marker);
+        if (markerIndex < 0) {
+          reject(new Error('FileReader did not return base64 data URL'));
+          return;
+        }
+        var base64 = dataUrl.slice(markerIndex + marker.length);
+        if (!base64) {
+          reject(new Error('FileReader returned empty chunk'));
+          return;
+        }
+        resolve(base64);
       };
       reader.onerror = function () {
         reject(reader.error || new Error('FileReader failed'));
@@ -218,30 +207,30 @@
       reader.onabort = function () {
         reject(new Error('FileReader aborted'));
       };
-      reader.readAsArrayBuffer(blob.slice(start, end));
+      reader.readAsDataURL(blob.slice(start, end));
     });
   }
 
   function sendBlobChunks(id, blob) {
-    if (blob.stream && typeof ReadableStream !== 'undefined') {
-      var reader = blob.stream().getReader();
-      function pump() {
-        return reader.read().then(function (result) {
-          if (result.done) return;
-          var next = result.value ? sendBytes(id, result.value) : Promise.resolve();
-          return next.then(pump);
-        });
-      }
-      return pump();
+    var totalSize = typeof blob.size === 'number' && blob.size >= 0 ? blob.size : -1;
+    if (totalSize < 0) {
+      return Promise.reject(new Error('Invalid blob size'));
     }
 
     var offset = 0;
     function readNext() {
-      if (offset >= blob.size) return Promise.resolve();
-      var end = Math.min(offset + CHUNK_BYTES, blob.size);
-      return readBlobSlice(blob, offset, end).then(function (buffer) {
+      if (offset >= totalSize) return Promise.resolve();
+      var end = Math.min(offset + CHUNK_BYTES, totalSize);
+      return readBlobSliceAsBase64(blob, offset, end).then(function (base64) {
         offset = end;
-        return sendBytes(id, new Uint8Array(buffer)).then(readNext);
+        return sendNative({
+          type: 'appendDownloadChunk',
+          id: id,
+          data: base64
+        }).then(function (response) {
+          assertOk(response, 'Native download chunk rejected');
+          return readNext();
+        });
       });
     }
     return readNext();
@@ -333,14 +322,35 @@
 
   installDetachedAnchorClickHook();
 
+  function findDownloadAnchor(event) {
+    var target = event && event.target;
+    if (target && typeof target.closest === 'function') {
+      var direct =
+        target.closest('a[href^="blob:"]') ||
+        target.closest('a[href^="data:"][download]');
+      if (direct) return direct;
+    }
+    if (event && typeof event.composedPath === 'function') {
+      var path = event.composedPath();
+      for (var i = 0; i < path.length; i++) {
+        var node = path[i];
+        if (!node || node.nodeType !== 1 || node.tagName !== 'A') continue;
+        var href = typeof node.href === 'string' ? node.href : '';
+        if (
+          href.indexOf('blob:') === 0 ||
+          (href.indexOf('data:') === 0 && typeof node.hasAttribute === 'function' && node.hasAttribute('download'))
+        ) {
+          return node;
+        }
+      }
+    }
+    return null;
+  }
+
   document.addEventListener(
     'click',
     function (event) {
-      var target = event.target;
-      if (!target || !target.closest) return;
-      var anchor =
-        target.closest('a[href^="blob:"]') ||
-        target.closest('a[href^="data:"][download]');
+      var anchor = findDownloadAnchor(event);
       if (!anchor) return;
       event.preventDefault();
       sendPageDownload(anchor.href, fileNameFromAnchor(anchor));
