@@ -6,9 +6,13 @@
   var DEFAULT_MIME_TYPE = 'application/octet-stream';
   var CHUNK_BYTES = 256 * 1024;
   var BYTE_STRING_BATCH = 32768;
+  var SESSION_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
   var port = null;
   var lastNavCanGoBack = null;
+  var lastVisibleAt = document.visibilityState === 'visible' ? Date.now() : 0;
+  var lastSessionCheckAt = Date.now();
+  var sessionRefreshInFlight = false;
 
   function getPageSevporNav() {
     try {
@@ -43,6 +47,7 @@
   }
 
   function syncNavState(force) {
+    if (!force && document.visibilityState !== 'visible') return;
     var canGoBack = querySevporNavCanGoBack();
     if (!force && canGoBack === lastNavCanGoBack) return;
     lastNavCanGoBack = canGoBack;
@@ -76,6 +81,55 @@
     });
   }
 
+  function handleForegroundResume() {
+    try {
+      var now = Date.now();
+      if (
+        document.visibilityState === 'visible' &&
+        now - lastVisibleAt > 1000
+      ) {
+        lastVisibleAt = now;
+        document.dispatchEvent(new Event('visibilitychange'));
+      }
+
+      if (
+        sessionRefreshInFlight ||
+        now - lastSessionCheckAt < SESSION_CHECK_INTERVAL_MS
+      ) {
+        return;
+      }
+
+      sessionRefreshInFlight = true;
+      function clearInFlight() {
+        sessionRefreshInFlight = false;
+      }
+
+      fetch('/api/auth/get-session', {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store'
+      })
+        .then(function (response) {
+          if (!response.ok) return null;
+          lastSessionCheckAt = Date.now();
+          return response.json().catch(function () {
+            return null;
+          });
+        })
+        .then(function (data) {
+          if (data && data.needsRefresh === true) {
+            return fetch('/api/auth/get-session', {
+              method: 'POST',
+              credentials: 'include',
+              cache: 'no-store'
+            });
+          }
+        })
+        .catch(function () {})
+        .then(clearInFlight, clearInFlight);
+    } catch (e) {}
+  }
+
   function connectNativePort() {
     if (port) return;
     try {
@@ -86,6 +140,8 @@
           handleNativeGoBack(message.requestId);
         } else if (message.type === 'downloadPageUrl' && message.url) {
           sendPageDownload(message.url, message.fileName || 'download');
+        } else if (message.type === 'foregroundResume') {
+          handleForegroundResume();
         }
       });
       port.onDisconnect.addListener(function () {
@@ -208,6 +264,8 @@
       .catch(function (error) {
         if (started) {
           sendNative({ type: 'cancelDownload', id: id }).catch(function () {});
+        } else {
+          sendNative({ type: 'downloadFailed' }).catch(function () {});
         }
         console.error('Sevpor GeckoView download failed', error);
       });
@@ -217,6 +275,48 @@
     var name = anchor.getAttribute('download') || '';
     return name || 'download';
   }
+
+  function installDetachedAnchorClickHook() {
+    try {
+      var pageWindow = window.wrappedJSObject;
+      if (
+        !pageWindow ||
+        !pageWindow.HTMLAnchorElement ||
+        !pageWindow.HTMLAnchorElement.prototype ||
+        typeof exportFunction !== 'function'
+      ) {
+        return;
+      }
+      var proto = pageWindow.HTMLAnchorElement.prototype;
+      var originalClick = proto.click;
+      if (typeof originalClick !== 'function') return;
+
+      exportFunction(
+        function () {
+          try {
+            var href = this && typeof this.href === 'string' ? this.href : '';
+            var isBlob = href.indexOf('blob:') === 0;
+            var isDataDownload =
+              href.indexOf('data:') === 0 &&
+              typeof this.hasAttribute === 'function' &&
+              this.hasAttribute('download');
+            if ((isBlob || isDataDownload) && !this.isConnected) {
+              var name =
+                (typeof this.getAttribute === 'function' && this.getAttribute('download')) ||
+                'download';
+              sendPageDownload(href, name);
+              return;
+            }
+          } catch (e) {}
+          return originalClick.apply(this, arguments);
+        },
+        proto,
+        { defineAs: 'click' }
+      );
+    } catch (e) {}
+  }
+
+  installDetachedAnchorClickHook();
 
   document.addEventListener(
     'click',
@@ -234,6 +334,17 @@
   );
 
   if (window === window.top) {
+    document.addEventListener(
+      'visibilitychange',
+      function () {
+        if (document.visibilityState === 'visible') {
+          lastVisibleAt = Date.now();
+          syncNavState(false);
+        }
+      },
+      true
+    );
+
     connectNativePort();
     window.addEventListener('popstate', function () {
       window.setTimeout(function () {

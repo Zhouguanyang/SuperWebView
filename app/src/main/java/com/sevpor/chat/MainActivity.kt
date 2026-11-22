@@ -22,6 +22,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var promptHandler: GeckoPromptHandler
     private lateinit var sessionController: GeckoSessionController
 
+    private var wasPaused = false
     private val permissionQueue = ArrayDeque<PendingPermissionRequest>()
     private var activePermissionRequest: PendingPermissionRequest? = null
 
@@ -45,10 +46,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT),
-        )
+        applyEdgeToEdge()
         super.onCreate(savedInstanceState)
 
         val runtime = GeckoRuntimeHolder.getOrCreate(applicationContext)
@@ -86,18 +84,41 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onResume() {
-        super.onResume()
+    override fun onStart() {
+        super.onStart()
         sessionController.setActive(true)
     }
 
+    override fun onResume() {
+        super.onResume()
+        sessionController.setFocused(true)
+        if (sessionController.isFullScreen) {
+            updateFullScreenSystemBars(true)
+        }
+        if (wasPaused) {
+            wasPaused = false
+            sessionController.scheduleForegroundResume()
+        }
+    }
+
     override fun onPause() {
-        sessionController.setActive(false)
+        wasPaused = true
+        sessionController.cancelForegroundResume()
+        sessionController.setFocused(false)
         super.onPause()
+    }
+
+    override fun onStop() {
+        sessionController.setActive(false)
+        super.onStop()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        applyEdgeToEdge()
+        if (::sessionController.isInitialized && sessionController.isFullScreen) {
+            updateFullScreenSystemBars(true)
+        }
         GeckoRuntimeHolder.getOrNull()?.configurationChanged(newConfig)
     }
 
@@ -108,6 +129,13 @@ class MainActivity : ComponentActivity() {
         downloadHandler.cleanup()
         sessionController.closeAll()
         super.onDestroy()
+    }
+
+    private fun applyEdgeToEdge() {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT),
+        )
     }
 
     private fun enqueuePermissionRequest(

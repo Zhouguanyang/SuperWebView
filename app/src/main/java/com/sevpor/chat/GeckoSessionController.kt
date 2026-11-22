@@ -34,8 +34,17 @@ import org.mozilla.geckoview.WebRequestError
 import org.mozilla.geckoview.WebResponse
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val BRIDGE_GO_BACK_TIMEOUT_MS = 300L
+private const val EXTENSION_READY_TIMEOUT_MS = 800L
+private const val FOREGROUND_RESUME_DISPATCH_DELAY_MS = 150L
+
+data class MainLoadErrorState(
+    val uri: String?,
+    val category: Int,
+    val code: Int,
+)
 
 class GeckoSessionController(
     private val activity: Activity,
@@ -68,74 +77,96 @@ class GeckoSessionController(
     var isFullScreen: Boolean by mutableStateOf(false)
         private set
 
-    private var mainView: GeckoView? = null
-    private var popupView: GeckoView? = null
+    var mainLoadError: MainLoadErrorState? by mutableStateOf(null)
+        private set
+
+    private var attachedView: GeckoView? = null
     private var lastMainUrl: String? = WEBSITE
+    private var lastPopupUrl: String? = null
+    private var isStarted = false
     private var isResumed = false
     private var isClosed = false
 
-    private var bridgePort: WebExtension.Port? = null
+    private var mainBridgePort: WebExtension.Port? = null
+    private var popupBridgePort: WebExtension.Port? = null
     private var pendingGoBackRequestId: String? = null
     private var pendingGoBackFallback: (() -> Unit)? = null
     private var pendingGoBackTimeout: Runnable? = null
+    private var pendingInitialLoadTimeout: Runnable? = null
+    private var pendingForegroundResumeRunnable: Runnable? = null
 
     init {
         configureSession(mainSession, isPopup = false)
-        attachBuiltInExtensionBridge(mainSession)
         mainSession.open(runtime)
-        mainSession.loadUri(WEBSITE)
+        startInitialLoadWithExtension()
     }
 
-    fun attachMainView(view: GeckoView) {
-        if (mainView !== view) {
-            mainView?.let { previous ->
-                if (previous.session === mainSession) {
+    fun attachView(view: GeckoView, session: GeckoSession) {
+        if (isClosed) return
+        if (attachedView !== view) {
+            attachedView?.let { previous ->
+                if (previous.session != null) {
                     previous.releaseSession()
                 }
             }
-            mainView = view
-        }
-        if (view.session !== mainSession) {
-            view.setSession(mainSession)
-        }
-        syncActiveState()
-    }
-
-    fun detachMainView(view: GeckoView) {
-        if (view.session === mainSession) {
-            view.releaseSession()
-        }
-        if (mainView === view) {
-            mainView = null
-        }
-    }
-
-    fun attachPopupView(view: GeckoView, session: GeckoSession) {
-        if (popupView !== view) {
-            popupView?.let { previous ->
-                if (previous.session === session) {
-                    previous.releaseSession()
-                }
-            }
-            popupView = view
+            attachedView = view
         }
         if (view.session !== session) {
+            if (view.session != null) {
+                view.releaseSession()
+            }
             view.setSession(session)
         }
         syncActiveState()
     }
 
-    fun detachPopupView(view: GeckoView, session: GeckoSession) {
-        if (view.session === session) {
+    fun detachView(view: GeckoView) {
+        if (view.session != null) {
             view.releaseSession()
         }
-        if (popupView === view) {
-            popupView = null
+        if (attachedView === view) {
+            attachedView = null
         }
     }
 
     fun setActive(active: Boolean) {
-        isResumed = active
+        isStarted = active
+        syncActiveState()
+    }
+
+    fun setFocused(focused: Boolean) {
+        isResumed = focused
+        syncActiveState()
+    }
+
+    fun scheduleForegroundResume() {
+        cancelForegroundResume()
+        val runnable = Runnable {
+            pendingForegroundResumeRunnable = null
+            if (isClosed || !isResumed) return@Runnable
+            val port = mainBridgePort ?: return@Runnable
+            if (!isTrustedWebUrl(lastMainUrl)) return@Runnable
+            runCatching {
+                port.postMessage(JSONObject().put("type", "foregroundResume"))
+            }.onFailure { Log.w(TAG, "Unable to send foregroundResume to sevpor_bridge", it) }
+        }
+        pendingForegroundResumeRunnable = runnable
+        mainHandler.postDelayed(runnable, FOREGROUND_RESUME_DISPATCH_DELAY_MS)
+    }
+
+    fun cancelForegroundResume() {
+        pendingForegroundResumeRunnable?.let(mainHandler::removeCallbacks)
+        pendingForegroundResumeRunnable = null
+    }
+
+    fun retryMainLoad() {
+        if (isClosed) return
+        val targetUrl = mainLoadError?.uri?.takeIf { it.isNotBlank() } ?: lastMainUrl ?: WEBSITE
+        mainLoadError = null
+        if (!mainSession.isOpen) {
+            mainSession.open(runtime)
+        }
+        mainSession.loadUri(targetUrl)
         syncActiveState()
     }
 
@@ -162,6 +193,7 @@ class GeckoSessionController(
     fun navigateBackMain(onNoBackStack: () -> Unit) {
         val fallback = {
             if (mainCanGoBack && mainSession.isOpen) {
+                mainLoadError = null
                 sevporNavCanGoBack = false
                 mainSession.goBack()
             } else {
@@ -169,8 +201,8 @@ class GeckoSessionController(
             }
         }
 
-        val port = bridgePort
-        if (sevporNavCanGoBack && port != null) {
+        val port = mainBridgePort
+        if (mainLoadError == null && sevporNavCanGoBack && port != null) {
             cancelPendingGoBack()
             val requestId = UUID.randomUUID().toString()
             pendingGoBackRequestId = requestId
@@ -211,36 +243,72 @@ class GeckoSessionController(
             isFullScreen = false
             onFullScreenChanged(false)
         }
-        popupView?.let { view ->
-            if (view.session === popup) {
-                view.releaseSession()
-            }
+        runCatching { popupBridgePort?.disconnect() }
+        popupBridgePort = null
+        lastPopupUrl = null
+
+        val view = attachedView
+        if (view != null && view.session === popup) {
+            view.releaseSession()
         }
-        popupView = null
         popupSession = null
         popupCanGoBack = false
         if (popup.isOpen) {
             runCatching { popup.close() }
+        }
+        if (!isClosed && view != null && mainSession.isOpen && view.session !== mainSession) {
+            view.setSession(mainSession)
         }
         syncActiveState()
     }
 
     fun closeAll() {
         isClosed = true
+        pendingInitialLoadTimeout?.let(mainHandler::removeCallbacks)
+        pendingInitialLoadTimeout = null
+        cancelForegroundResume()
         cancelPendingGoBack()
-        runCatching { bridgePort?.disconnect() }
-        bridgePort = null
+        runCatching { mainBridgePort?.disconnect() }
+        mainBridgePort = null
+        runCatching { popupBridgePort?.disconnect() }
+        popupBridgePort = null
 
         closePopupSession()
 
-        mainView?.let { view ->
-            if (view.session === mainSession) {
+        attachedView?.let { view ->
+            if (view.session != null) {
                 view.releaseSession()
             }
         }
-        mainView = null
+        attachedView = null
         if (mainSession.isOpen) {
             runCatching { mainSession.close() }
+        }
+    }
+
+    private fun startInitialLoadWithExtension() {
+        val initialLoadStarted = AtomicBoolean(false)
+        val startLoadOnce = {
+            if (!isClosed && initialLoadStarted.compareAndSet(false, true)) {
+                pendingInitialLoadTimeout?.let(mainHandler::removeCallbacks)
+                pendingInitialLoadTimeout = null
+                if (mainSession.isOpen) {
+                    mainSession.loadUri(WEBSITE)
+                }
+            }
+        }
+
+        val timeoutRunnable = Runnable {
+            if (!isClosed && initialLoadStarted.get().not()) {
+                Log.w(TAG, "Built-in extension install timed out; loading homepage without waiting")
+                startLoadOnce()
+            }
+        }
+        pendingInitialLoadTimeout = timeoutRunnable
+        mainHandler.postDelayed(timeoutRunnable, EXTENSION_READY_TIMEOUT_MS)
+
+        attachBuiltInExtensionBridge(mainSession, isPopup = false) {
+            startLoadOnce()
         }
     }
 
@@ -253,11 +321,11 @@ class GeckoSessionController(
                 mainSession.setFocused(false)
             }
             if (popup.isOpen) {
-                popup.setActive(isResumed)
+                popup.setActive(isStarted)
                 popup.setFocused(isResumed)
             }
         } else if (mainSession.isOpen) {
-            mainSession.setActive(isResumed)
+            mainSession.setActive(isStarted)
             mainSession.setFocused(isResumed)
         }
     }
@@ -279,7 +347,7 @@ class GeckoSessionController(
                 val uri = runCatching { Uri.parse(request.uri) }.getOrNull()
                     ?: return GeckoResult.allow()
                 return when (uri.scheme?.lowercase(Locale.US)) {
-                    "http", "https", "about", "data", "blob" -> GeckoResult.allow()
+                    "http", "https", "about", "data", "blob", "javascript" -> GeckoResult.allow()
                     "intent" -> {
                         openIntentUri(activity, session, uri)
                         GeckoResult.deny()
@@ -298,7 +366,9 @@ class GeckoSessionController(
                 closePopupSession()
                 val newPopup = GeckoSession(GeckoRuntimeHolder.defaultSessionSettings())
                 configureSession(newPopup, isPopup = true)
+                attachBuiltInExtensionBridge(newPopup, isPopup = true)
                 popupCanGoBack = false
+                lastPopupUrl = uri
                 popupSession = newPopup
                 if (mainSession.isOpen) {
                     mainSession.setActive(false)
@@ -322,7 +392,10 @@ class GeckoSessionController(
                 perms: MutableList<ContentPermission>,
                 hasUserGesture: Boolean,
             ) {
-                if (!isPopup && !url.isNullOrBlank()) {
+                if (url.isNullOrBlank()) return
+                if (isPopup) {
+                    if (session === popupSession) lastPopupUrl = url
+                } else {
                     lastMainUrl = url
                     if (!isTrustedWebUrl(url)) {
                         sevporNavCanGoBack = false
@@ -339,6 +412,13 @@ class GeckoSessionController(
                 if (error.category == WebRequestError.ERROR_CATEGORY_SECURITY) {
                     showSslErrorDialog(uri)
                 }
+                if (!isPopup && session === mainSession) {
+                    mainLoadError = MainLoadErrorState(
+                        uri = uri ?: lastMainUrl ?: WEBSITE,
+                        category = error.category,
+                        code = error.code,
+                    )
+                }
                 return null
             }
         }
@@ -346,22 +426,19 @@ class GeckoSessionController(
     private fun createContentDelegate(isPopup: Boolean): ContentDelegate =
         object : ContentDelegate {
             override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
-                val requestPageDownload: ((String, String) -> Unit)? = if (!isPopup) {
-                    { blobUrl, fileName ->
-                        val port = bridgePort
-                        if (port != null && isTrustedWebUrl(lastMainUrl)) {
-                            runCatching {
-                                port.postMessage(
-                                    JSONObject()
-                                        .put("type", "downloadPageUrl")
-                                        .put("url", blobUrl)
-                                        .put("fileName", fileName),
-                                )
-                            }.onFailure { Log.w(TAG, "Unable to trigger page blob download", it) }
-                        }
+                val requestPageDownload: (String, String) -> Unit = { blobUrl, fileName ->
+                    val port = if (isPopup) popupBridgePort else mainBridgePort
+                    val currentUrl = if (isPopup) lastPopupUrl else lastMainUrl
+                    if (port != null && isTrustedWebUrl(currentUrl)) {
+                        runCatching {
+                            port.postMessage(
+                                JSONObject()
+                                    .put("type", "downloadPageUrl")
+                                    .put("url", blobUrl)
+                                    .put("fileName", fileName),
+                            )
+                        }.onFailure { Log.w(TAG, "Unable to trigger page blob download", it) }
                     }
-                } else {
-                    null
                 }
                 downloadHandler.handleExternalResponse(response, requestPageDownload)
             }
@@ -395,6 +472,7 @@ class GeckoSessionController(
                 if (isPopup && session === popupSession) {
                     syncActiveState()
                 } else if (!isPopup) {
+                    mainLoadError = null
                     sevporNavCanGoBack = false
                 }
             }
@@ -471,22 +549,27 @@ class GeckoSessionController(
                 audio: Array<out MediaSource>?,
                 callback: MediaCallback,
             ) {
+                val videoSources = video?.takeIf { it.isNotEmpty() }
+                val audioSources = audio?.takeIf { it.isNotEmpty() }
                 val neededPermissions = buildList {
-                    if (!video.isNullOrEmpty()) add(Manifest.permission.CAMERA)
-                    if (!audio.isNullOrEmpty()) add(Manifest.permission.RECORD_AUDIO)
+                    if (videoSources != null) add(Manifest.permission.CAMERA)
+                    if (audioSources != null) add(Manifest.permission.RECORD_AUDIO)
                 }.toTypedArray()
 
                 val finishGrant: (Map<String, Boolean>) -> Unit = { results ->
-                    val canUseVideo = !video.isNullOrEmpty() && isPermissionGranted(Manifest.permission.CAMERA, results)
-                    val canUseAudio = !audio.isNullOrEmpty() && isPermissionGranted(Manifest.permission.RECORD_AUDIO, results)
-
-                    val selectedVideo = if (canUseVideo && video != null) {
-                        video.firstOrNull { it.source == MediaSource.SOURCE_CAMERA } ?: video.firstOrNull()
+                    val selectedVideo = if (
+                        videoSources != null && isPermissionGranted(Manifest.permission.CAMERA, results)
+                    ) {
+                        videoSources.firstOrNull { it.source == MediaSource.SOURCE_CAMERA }
+                            ?: videoSources.firstOrNull()
                     } else {
                         null
                     }
-                    val selectedAudio = if (canUseAudio && audio != null) {
-                        audio.firstOrNull { it.source == MediaSource.SOURCE_MICROPHONE } ?: audio.firstOrNull()
+                    val selectedAudio = if (
+                        audioSources != null && isPermissionGranted(Manifest.permission.RECORD_AUDIO, results)
+                    ) {
+                        audioSources.firstOrNull { it.source == MediaSource.SOURCE_MICROPHONE }
+                            ?: audioSources.firstOrNull()
                     } else {
                         null
                     }
@@ -507,7 +590,11 @@ class GeckoSessionController(
             }
         }
 
-    private fun attachBuiltInExtensionBridge(session: GeckoSession) {
+    private fun attachBuiltInExtensionBridge(
+        session: GeckoSession,
+        isPopup: Boolean,
+        onReady: (() -> Unit)? = null,
+    ) {
         val messageDelegate = object : WebExtension.MessageDelegate {
             override fun onConnect(port: WebExtension.Port) {
                 if (!isTrustedWebUrl(port.sender.url) || !port.sender.isTopLevel()) {
@@ -515,13 +602,28 @@ class GeckoSessionController(
                     port.disconnect()
                     return
                 }
-                if (bridgePort !== port) {
-                    runCatching { bridgePort?.disconnect() }
-                    bridgePort = port
+                if (isPopup) {
+                    if (popupBridgePort !== port) {
+                        runCatching { popupBridgePort?.disconnect() }
+                        popupBridgePort = port
+                    }
+                    port.setDelegate(object : WebExtension.PortDelegate {
+                        override fun onDisconnect(p: WebExtension.Port) {
+                            if (p === popupBridgePort) {
+                                popupBridgePort = null
+                            }
+                        }
+                    })
+                    return
+                }
+
+                if (mainBridgePort !== port) {
+                    runCatching { mainBridgePort?.disconnect() }
+                    mainBridgePort = port
                 }
                 port.setDelegate(object : WebExtension.PortDelegate {
                     override fun onPortMessage(message: Any, p: WebExtension.Port) {
-                        if (p !== bridgePort || !isTrustedWebUrl(p.sender.url)) return
+                        if (p !== mainBridgePort || !isTrustedWebUrl(p.sender.url)) return
                         val json = message as? JSONObject ?: return
                         when (json.optString("type")) {
                             "sevporNavState" -> {
@@ -543,8 +645,8 @@ class GeckoSessionController(
                     }
 
                     override fun onDisconnect(p: WebExtension.Port) {
-                        if (p === bridgePort) {
-                            bridgePort = null
+                        if (p === mainBridgePort) {
+                            mainBridgePort = null
                             sevporNavCanGoBack = false
                             val fallback = pendingGoBackFallback
                             cancelPendingGoBack()
@@ -580,14 +682,15 @@ class GeckoSessionController(
             }
         }
 
-        GeckoRuntimeHolder.withBuiltInExtension { extension ->
-            if (!isClosed) {
+        GeckoRuntimeHolder.withBuiltInExtensionReady { extension ->
+            if (!isClosed && extension != null) {
                 session.webExtensionController.setMessageDelegate(
                     extension,
                     messageDelegate,
                     EXTENSION_NATIVE_APP,
                 )
             }
+            onReady?.invoke()
         }
     }
 
@@ -602,8 +705,9 @@ class GeckoSessionController(
             isFullScreen = false
             onFullScreenChanged(false)
         }
+        mainLoadError = null
         cancelPendingGoBack()
-        bridgePort = null
+        mainBridgePort = null
         sevporNavCanGoBack = false
 
         if (!session.isOpen) {
@@ -643,10 +747,16 @@ class GeckoSessionController(
 
 private fun openIntentUri(context: Context, session: GeckoSession, uri: Uri) {
     try {
-        val intent = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME)
-        if (intent.resolveActivity(context.packageManager) != null) {
+        val intent = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME).apply {
+            addCategory(Intent.CATEGORY_BROWSABLE)
+            component = null
+            selector = null
+        }
+        try {
             launchExternalActivity(context, intent)
             return
+        } catch (_: ActivityNotFoundException) {
+            // Fall through to browser_fallback_url if no matching app is installed.
         }
         intent.getStringExtra("browser_fallback_url")?.let { fallbackUrl ->
             if (session.isOpen) {

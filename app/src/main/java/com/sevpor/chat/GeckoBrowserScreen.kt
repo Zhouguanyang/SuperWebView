@@ -3,21 +3,34 @@ package com.sevpor.chat
 import android.app.Activity
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import org.mozilla.geckoview.GeckoView
 
@@ -31,6 +44,8 @@ fun GeckoBrowserScreen(
     val backgroundColorArgb = MaterialTheme.colorScheme.background.toArgb()
     val isFullScreen = controller.isFullScreen
     val popupSession = controller.popupSession
+    val activeSession = popupSession ?: controller.mainSession
+    val mainLoadError = controller.mainLoadError
     var lastExitBackPressedAt by remember { mutableLongStateOf(0L) }
 
     // BackHandlers in Compose are evaluated in reverse registration order (last registered wins).
@@ -62,15 +77,17 @@ fun GeckoBrowserScreen(
         color = MaterialTheme.colorScheme.background,
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            var mainGeckoView by remember { mutableStateOf<GeckoView?>(null) }
+            var geckoView by remember { mutableStateOf<GeckoView?>(null) }
 
-            DisposableEffect(controller.mainSession) {
+            DisposableEffect(Unit) {
                 onDispose {
-                    mainGeckoView?.let { controller.detachMainView(it) }
-                    mainGeckoView = null
+                    geckoView?.let { controller.detachView(it) }
+                    geckoView = null
                 }
             }
 
+            // Single GeckoView host switching between mainSession and popupSession avoids
+            // overlapping SurfaceView Z-order issues on Android.
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { context ->
@@ -79,45 +96,62 @@ fun GeckoBrowserScreen(
                         coverUntilFirstPaint(backgroundColorArgb)
                         autofillEnabled = true
                         setActivityContextDelegate { activity }
-                        mainGeckoView = this
-                        controller.attachMainView(this)
+                        geckoView = this
+                        controller.attachView(this, activeSession)
                     }
                 },
                 update = { view ->
                     view.setBackgroundColor(backgroundColorArgb)
-                    controller.attachMainView(view)
+                    controller.attachView(view, activeSession)
                 },
             )
 
-            if (popupSession != null) {
-                key(popupSession) {
-                    var popupGeckoView by remember { mutableStateOf<GeckoView?>(null) }
+            if (popupSession == null && mainLoadError != null) {
+                LoadErrorOverlay(
+                    onRetry = controller::retryMainLoad,
+                )
+            }
+        }
+    }
+}
 
-                    DisposableEffect(popupSession) {
-                        onDispose {
-                            popupGeckoView?.let { controller.detachPopupView(it, popupSession) }
-                            popupGeckoView = null
-                        }
-                    }
-
-                    AndroidView(
-                        modifier = Modifier.fillMaxSize(),
-                        factory = { context ->
-                            GeckoView(context).apply {
-                                setBackgroundColor(backgroundColorArgb)
-                                coverUntilFirstPaint(backgroundColorArgb)
-                                autofillEnabled = true
-                                setActivityContextDelegate { activity }
-                                popupGeckoView = this
-                                controller.attachPopupView(this, popupSession)
-                            }
-                        },
-                        update = { view ->
-                            view.setBackgroundColor(backgroundColorArgb)
-                            controller.attachPopupView(view, popupSession)
-                        },
-                    )
-                }
+@Composable
+private fun LoadErrorOverlay(
+    onRetry: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 32.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Image(
+                painter = painterResource(id = R.drawable.ic_error),
+                contentDescription = null,
+                modifier = Modifier.size(72.dp),
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = stringResource(id = R.string.error_title),
+                style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.onBackground,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = stringResource(id = R.string.error_message),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+            Button(onClick = onRetry) {
+                Text(text = stringResource(id = R.string.button_retry))
             }
         }
     }

@@ -22,21 +22,32 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
+import java.net.URLDecoder
+import java.nio.charset.Charset
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 private const val DEFAULT_DOWNLOAD_MIME_TYPE = "application/octet-stream"
+private const val TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1_000L
 
 class DownloadHandler(
-    private val context: Context,
+    context: Context,
     private val requestLegacyStoragePermission: () -> Unit,
 ) {
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val ioExecutor = Executors.newFixedThreadPool(4)
     private val activeBlobDownloads = mutableMapOf<String, BlobDownloadSession>()
     private val pendingStorageDownloads = ArrayDeque<PendingDownload>()
     private var awaitingStoragePermission = false
+
+    @Volatile
+    private var isCleanedUp = false
+
+    init {
+        executeIoSafely { cleanupStaleTempDownloads(appContext.cacheDir) }
+    }
 
     fun handleExternalResponse(
         response: WebResponse,
@@ -58,12 +69,12 @@ class DownloadHandler(
 
         if (body != null) {
             showToast(R.string.download_started)
-            ioExecutor.execute {
+            val queued = executeIoSafely {
                 val tempFile = runCatching { createTempDownloadFile(appContext.cacheDir) }.getOrNull()
                 if (tempFile == null) {
                     runCatching { body.close() }
                     showToast(R.string.download_failed)
-                    return@execute
+                    return@executeIoSafely
                 }
                 try {
                     body.use { input ->
@@ -84,13 +95,16 @@ class DownloadHandler(
                     showToast(R.string.download_failed)
                 }
             }
+            if (!queued) {
+                runCatching { body.close() }
+            }
             return
         }
 
         when (scheme) {
             "data" -> {
                 showToast(R.string.download_started)
-                ioExecutor.execute {
+                executeIoSafely {
                     try {
                         val download = writeDataUrlToTempFile(
                             cacheDirectory = appContext.cacheDir,
@@ -121,7 +135,7 @@ class DownloadHandler(
 
     @Synchronized
     fun beginBlobDownload(id: String?, mimeType: String?, fileName: String?): Boolean {
-        if (id.isNullOrBlank()) return false
+        if (isCleanedUp || id.isNullOrBlank()) return false
         runCatching { activeBlobDownloads.remove(id)?.close(deleteFile = true) }
         return try {
             val tempFile = createTempDownloadFile(appContext.cacheDir)
@@ -131,16 +145,18 @@ class DownloadHandler(
                 fileName = sanitizeDownloadFileName(fileName),
                 mimeType = mimeType?.takeIf { it.isNotBlank() } ?: DEFAULT_DOWNLOAD_MIME_TYPE,
             )
+            showToast(R.string.download_started)
             true
         } catch (e: Exception) {
             Log.e(TAG, "Unable to begin blob download", e)
+            showToast(R.string.download_failed)
             false
         }
     }
 
     @Synchronized
     fun appendBlobDownloadChunk(id: String?, base64Data: String?): Boolean {
-        if (id.isNullOrBlank() || base64Data.isNullOrBlank()) return false
+        if (isCleanedUp || id.isNullOrBlank() || base64Data.isNullOrBlank()) return false
         val session = activeBlobDownloads[id] ?: return false
         try {
             session.output.write(Base64.decode(base64Data, Base64.DEFAULT))
@@ -151,12 +167,13 @@ class DownloadHandler(
             Log.e(TAG, "Unable to write blob download chunk", e)
         }
         activeBlobDownloads.remove(id)?.close(deleteFile = true)
+        showToast(R.string.download_failed)
         return false
     }
 
     @Synchronized
     fun finishBlobDownload(id: String?): Boolean {
-        if (id.isNullOrBlank()) return false
+        if (isCleanedUp || id.isNullOrBlank()) return false
         val session = activeBlobDownloads.remove(id) ?: return false
         return try {
             session.output.flush()
@@ -178,9 +195,13 @@ class DownloadHandler(
     }
 
     @Synchronized
-    fun cancelBlobDownload(id: String?) {
+    fun cancelBlobDownload(id: String?, notifyUser: Boolean = false) {
         if (id.isNullOrBlank()) return
-        activeBlobDownloads.remove(id)?.close(deleteFile = true)
+        val removed = activeBlobDownloads.remove(id)
+        removed?.close(deleteFile = true)
+        if (notifyUser && removed != null) {
+            showToast(R.string.download_failed)
+        }
     }
 
     @Synchronized
@@ -198,18 +219,21 @@ class DownloadHandler(
         }
         if (downloadsToProcess.isEmpty()) return
 
-        if (!granted) {
+        if (!granted || isCleanedUp) {
             downloadsToProcess.forEach { runCatching { it.tempFile.delete() } }
-            showToast(R.string.download_failed)
+            if (!granted) showToast(R.string.download_failed)
             return
         }
 
         downloadsToProcess.forEach { download ->
-            ioExecutor.execute { writePendingDownload(download) }
+            if (!executeIoSafely { writePendingDownload(download) }) {
+                runCatching { download.tempFile.delete() }
+            }
         }
     }
 
     fun cleanup() {
+        isCleanedUp = true
         cancelAllBlobDownloads()
         val leftovers = synchronized(pendingStorageDownloads) {
             awaitingStoragePermission = false
@@ -222,6 +246,10 @@ class DownloadHandler(
     }
 
     private fun enqueueSaveDownload(download: PendingDownload) {
+        if (isCleanedUp) {
+            runCatching { download.tempFile.delete() }
+            return
+        }
         if (
             Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
             ContextCompat.checkSelfPermission(
@@ -244,7 +272,9 @@ class DownloadHandler(
             return
         }
 
-        ioExecutor.execute { writePendingDownload(download) }
+        if (!executeIoSafely { writePendingDownload(download) }) {
+            runCatching { download.tempFile.delete() }
+        }
     }
 
     private fun writePendingDownload(download: PendingDownload) {
@@ -324,18 +354,40 @@ class DownloadHandler(
         base64Data: String?,
         onComplete: (Boolean) -> Unit,
     ) {
-        ioExecutor.execute {
+        if (isCleanedUp) {
+            onComplete(false)
+            return
+        }
+        val queued = executeIoSafely {
             val ok = when (type) {
                 "beginDownload" -> beginBlobDownload(id, mimeType, fileName)
                 "appendDownloadChunk" -> appendBlobDownloadChunk(id, base64Data)
                 "finishDownload" -> finishBlobDownload(id)
                 "cancelDownload" -> {
-                    cancelBlobDownload(id)
+                    cancelBlobDownload(id, notifyUser = true)
+                    true
+                }
+                "downloadFailed" -> {
+                    showToast(R.string.download_failed)
                     true
                 }
                 else -> false
             }
             mainHandler.post { onComplete(ok) }
+        }
+        if (!queued) {
+            onComplete(false)
+        }
+    }
+
+    private fun executeIoSafely(block: () -> Unit): Boolean {
+        if (isCleanedUp || ioExecutor.isShutdown) return false
+        return try {
+            ioExecutor.execute(block)
+            true
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "Download executor rejected task after shutdown", e)
+            false
         }
     }
 
@@ -442,11 +494,70 @@ private fun createTempDownloadFile(cacheDirectory: File): File {
     return File.createTempFile("download_", ".tmp", directory)
 }
 
+private fun cleanupStaleTempDownloads(cacheDirectory: File) {
+    val directory = File(cacheDirectory, "gecko-downloads")
+    if (!directory.isDirectory) return
+    val cutoff = System.currentTimeMillis() - TEMP_FILE_MAX_AGE_MS
+    directory.listFiles()?.forEach { file ->
+        if (file.isFile && file.lastModified() < cutoff) {
+            runCatching { file.delete() }
+        }
+    }
+}
+
 private fun guessDownloadFileName(
     url: String,
     contentDisposition: String?,
     mimeType: String?,
-): String = sanitizeDownloadFileName(URLUtil.guessFileName(url, contentDisposition, mimeType))
+): String {
+    val parsedFromHeader = parseContentDispositionFileName(contentDisposition)
+    if (!parsedFromHeader.isNullOrBlank()) {
+        return sanitizeDownloadFileName(parsedFromHeader)
+    }
+    return sanitizeDownloadFileName(URLUtil.guessFileName(url, contentDisposition, mimeType))
+}
+
+private fun parseContentDispositionFileName(contentDisposition: String?): String? {
+    if (contentDisposition.isNullOrBlank()) return null
+
+    // Prefer RFC 5987 / RFC 8187 extended parameter: filename*=UTF-8''%E4%B8%AD%E6%96%87.pdf
+    val extMatch = Regex(
+        """filename\*\s*=\s*([^;]+)""",
+        RegexOption.IGNORE_CASE,
+    ).find(contentDisposition)
+    if (extMatch != null) {
+        val rawValue = extMatch.groupValues[1].trim().trim('"')
+        val firstQuote = rawValue.indexOf('\'')
+        val secondQuote = if (firstQuote >= 0) rawValue.indexOf('\'', firstQuote + 1) else -1
+        if (firstQuote > 0 && secondQuote > firstQuote) {
+            val charsetName = rawValue.substring(0, firstQuote).trim()
+            val encodedName = rawValue.substring(secondQuote + 1)
+            val decoded = runCatching {
+                val charset = runCatching { Charset.forName(charsetName) }.getOrDefault(Charsets.UTF_8)
+                URLDecoder.decode(encodedName.replace("+", "%2B"), charset.name())
+            }.getOrNull()
+            if (!decoded.isNullOrBlank()) return decoded
+        }
+    }
+
+    // Fallback to standard filename="..." or filename=...
+    val stdMatch = Regex(
+        """filename\s*=\s*(?:"((?:\\.|[^"\\])*)"|([^;]+))""",
+        RegexOption.IGNORE_CASE,
+    ).find(contentDisposition)
+    if (stdMatch != null) {
+        val quoted = stdMatch.groupValues[1]
+        val unquoted = stdMatch.groupValues[2]
+        val candidate = if (quoted.isNotEmpty()) {
+            quoted.replace("\\\"", "\"").replace("\\\\", "\\")
+        } else {
+            unquoted.trim()
+        }
+        if (candidate.isNotBlank()) return candidate
+    }
+
+    return null
+}
 
 private fun mimeTypeFromDataUrl(dataUrl: String): String? {
     if (!dataUrl.startsWith("data:", ignoreCase = true)) return null
