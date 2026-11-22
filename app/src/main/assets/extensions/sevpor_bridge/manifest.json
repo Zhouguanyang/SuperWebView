@@ -1,0 +1,28 @@
+{
+  "manifest_version": 2,
+  "name": "Sevpor Bridge",
+  "version": "1.0",
+  "description": "Internal navigation and blob/data download bridge for chat.sevpor.com",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "sevpor-bridge@sevpor.com"
+    }
+  },
+  "permissions": [
+    "nativeMessaging",
+    "nativeMessagingFromContent",
+    "geckoViewAddons"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.sevpor.com/*",
+        "https://*.chat.sevpor.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -19,6 +19,9 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "1.0.0"
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     buildTypes {
@@ -81,14 +84,8 @@ dependencies {
     debugImplementation(libs.androidx.ui.tooling)
     // Core
     implementation(libs.androidx.core.ktx)
-    // WebAuthn / passkeys
-    implementation(libs.androidx.credentials)
-    implementation(libs.androidx.credentials.play.services.auth)
-    implementation(libs.androidx.fragment)
-    // Webkit
-    implementation(libs.androidx.webkit)
+    // GeckoView
+    implementation(libs.mozilla.geckoview)
     // SplashScreen
     implementation(libs.androidx.core.splashscreen)
-    // Swiperefreshlayout
-    implementation(libs.androidx.swiperefreshlayout)
 }
