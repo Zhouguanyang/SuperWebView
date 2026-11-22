@@ -174,8 +174,16 @@
     return browser.runtime.sendNativeMessage(NATIVE_APP, payload);
   }
 
+  function isNativeOk(response) {
+    return response === 'ok' || response === true || (!!response && response.ok === true);
+  }
+
+  function isNativeError(response) {
+    return response === 'error' || response === false || (!!response && response.ok === false);
+  }
+
   function assertOk(response, errorMessage) {
-    if (!response || response.ok !== true) {
+    if (!isNativeOk(response)) {
       throw new Error(errorMessage);
     }
   }
@@ -254,8 +262,8 @@
           mimeType: blob.type || DEFAULT_MIME_TYPE,
           fileName: fileName || 'download'
         }).then(function (response) {
-          if (!response || response.ok !== true) {
-            if (response && response.ok === false) {
+          if (!isNativeOk(response)) {
+            if (isNativeError(response)) {
               nativeNotifiedFailure = true;
             }
             throw new Error('Native download rejected');

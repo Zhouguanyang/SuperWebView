@@ -726,12 +726,14 @@ class GeckoSessionController(
                 message: Any,
                 sender: WebExtension.MessageSender,
             ): GeckoResult<Any> {
+                // GeckoView passes onMessage results directly to EventCallback.sendSuccess(),
+                // whose JNI unboxer supports primitives/String/GeckoBundle but NOT JSONObject.
                 if (!isTrustedWebUrl(sender.url)) {
                     Log.w(TAG, "Blocked sevpor_bridge message from untrusted URL: ${sender.url}")
-                    return GeckoResult.fromValue(JSONObject().put("ok", false))
+                    return GeckoResult.fromValue("error")
                 }
                 val json = message as? JSONObject
-                    ?: return GeckoResult.fromValue(JSONObject().put("ok", false))
+                    ?: return GeckoResult.fromValue("error")
 
                 val result = GeckoResult<Any>()
                 downloadHandler.handleBridgeMessage(
@@ -741,7 +743,7 @@ class GeckoSessionController(
                     fileName = json.optString("fileName").takeIf { it.isNotBlank() },
                     base64Data = json.optString("data").takeIf { it.isNotBlank() },
                 ) { ok ->
-                    result.complete(JSONObject().put("ok", ok))
+                    result.complete(if (ok) "ok" else "error")
                 }
                 return result
             }
