@@ -52,6 +52,7 @@ android {
 
     packaging {
         jniLibs {
+            useLegacyPackaging = true
             keepDebugSymbols.add("**/libandroidx.graphics.path.so")
         }
     }
