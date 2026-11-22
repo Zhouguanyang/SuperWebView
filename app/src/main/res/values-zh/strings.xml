@@ -5,8 +5,9 @@
     <string name="error_message">出了点问题。</string>
     <string name="file_chooser_title">选择文件</string>
     <string name="download_started">已开始下载</string>
+    <string name="download_saved">已保存到下载目录</string>
     <string name="download_failed">下载失败</string>
-    <string name="download_not_supported">WebView 不支持此下载</string>
+    <string name="download_not_supported">不支持此下载</string>
     <string name="http_auth_title">需要登录</string>
     <string name="http_auth_message">%1$s %2$s</string>
     <string name="http_auth_username_hint">用户名</string>
@@ -14,4 +15,22 @@
     <string name="ssl_error_title">证书错误</string>
     <string name="ssl_error_message">无法验证与 %1$s 的安全连接。</string>
     <string name="press_back_again_to_exit">再按一次返回桌面</string>
+    <string name="prompt_before_unload_title">离开此页面？</string>
+    <string name="prompt_before_unload_message">你所做的更改可能不会被保存。</string>
+    <string name="prompt_leave">离开</string>
+    <string name="prompt_repost_title">确认重新提交表单</string>
+    <string name="prompt_repost_message">要显示此页面，必须重新发送你之前输入的数据。</string>
+    <string name="prompt_resend">重新发送</string>
+    <string name="prompt_folder_upload_title">上传文件夹？</string>
+    <string name="prompt_folder_upload_message">要上传“%1$s”中的所有文件吗？</string>
+    <string name="prompt_upload">上传</string>
+    <string name="prompt_popup_title">打开新窗口？</string>
+    <string name="prompt_redirect_title">允许重定向？</string>
+    <string name="prompt_allow_navigation_message">允许此页面打开 %1$s？</string>
+    <string name="prompt_allow">允许</string>
+    <string name="prompt_color_title">选择颜色</string>
+    <string name="prompt_color_hint">#RRGGBB</string>
+    <string name="prompt_date_month_hint">YYYY-MM</string>
+    <string name="prompt_date_week_hint">YYYY-Www</string>
+    <string name="prompt_share_title">分享</string>
 </resources>

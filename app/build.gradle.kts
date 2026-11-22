@@ -1,9 +1,21 @@
+import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose.compiler)
 }
+
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.isFile) {
+        file.inputStream().use { load(it) }
+    }
+}
+
+fun signingProp(name: String): String? =
+    System.getenv(name)?.takeIf { it.isNotBlank() }
+        ?: localProperties.getProperty(name)?.takeIf { it.isNotBlank() }
 
 android {
     namespace = "com.sevpor.chat"
@@ -19,12 +31,40 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "1.0.0"
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    val releaseStoreFilePath = signingProp("RELEASE_STORE_FILE")
+    val releaseStorePassword = signingProp("RELEASE_STORE_PASSWORD")
+    val releaseKeyAlias = signingProp("RELEASE_KEY_ALIAS")
+    val releaseKeyPassword = signingProp("RELEASE_KEY_PASSWORD")
+    val hasReleaseSigning =
+        !releaseStoreFilePath.isNullOrBlank() &&
+            !releaseStorePassword.isNullOrBlank() &&
+            !releaseKeyAlias.isNullOrBlank() &&
+            !releaseKeyPassword.isNullOrBlank() &&
+            file(releaseStoreFilePath).isFile
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseStoreFilePath!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
             )
@@ -49,6 +89,7 @@ android {
 
     packaging {
         jniLibs {
+            useLegacyPackaging = true
             keepDebugSymbols.add("**/libandroidx.graphics.path.so")
         }
     }
@@ -81,14 +122,8 @@ dependencies {
     debugImplementation(libs.androidx.ui.tooling)
     // Core
     implementation(libs.androidx.core.ktx)
-    // WebAuthn / passkeys
-    implementation(libs.androidx.credentials)
-    implementation(libs.androidx.credentials.play.services.auth)
-    implementation(libs.androidx.fragment)
-    // Webkit
-    implementation(libs.androidx.webkit)
+    // GeckoView
+    implementation(libs.mozilla.geckoview)
     // SplashScreen
     implementation(libs.androidx.core.splashscreen)
-    // Swiperefreshlayout
-    implementation(libs.androidx.swiperefreshlayout)
 }
