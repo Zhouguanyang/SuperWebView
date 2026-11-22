@@ -30,6 +30,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 
 private const val DEFAULT_DOWNLOAD_MIME_TYPE = "application/octet-stream"
+private val GENERIC_BINARY_MIME_TYPES = setOf(
+    DEFAULT_DOWNLOAD_MIME_TYPE,
+    "binary/octet-stream",
+)
+private const val MAX_DOWNLOAD_FILE_NAME_LENGTH = 180
 private const val TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1_000L
 
 class DownloadHandler(
@@ -52,21 +57,27 @@ class DownloadHandler(
 
     fun handleExternalResponse(
         response: WebResponse,
-        onRequestPageBlobDownload: ((url: String, fileName: String) -> Unit)? = null,
+        onRequestPageBlobDownload: ((url: String, fileName: String) -> Boolean)? = null,
     ) {
+        if (isCleanedUp) {
+            runCatching { response.body?.close() }
+            return
+        }
         val url = response.uri
         val scheme = runCatching { Uri.parse(url).scheme?.lowercase(Locale.US) }.getOrNull()
         val contentDisposition = response.headerIgnoreCase("content-disposition")
         val contentType = response.headerIgnoreCase("content-type")
             ?.let(::normalizeDownloadMimeTypeOrNull)
-        val effectiveMimeType = contentType ?: mimeTypeFromDataUrl(url)
+        val initialMimeType = contentType ?: mimeTypeFromDataUrl(url)
+        val guessedFileName = guessDownloadFileName(
+            url = if (scheme == "data") "download" else url,
+            contentDisposition = contentDisposition,
+            mimeType = initialMimeType,
+        )
+        val resolvedMimeType = resolveDownloadMimeType(initialMimeType, guessedFileName)
         val fileName = ensureDownloadExtension(
-            fileName = guessDownloadFileName(
-                url = if (scheme == "data") "download" else url,
-                contentDisposition = contentDisposition,
-                mimeType = effectiveMimeType,
-            ),
-            mimeType = effectiveMimeType,
+            fileName = guessedFileName,
+            mimeType = resolvedMimeType,
         )
         val body = response.body
 
@@ -89,7 +100,7 @@ class DownloadHandler(
                         PendingDownload(
                             tempFile = tempFile,
                             fileName = fileName,
-                            mimeType = effectiveMimeType ?: DEFAULT_DOWNLOAD_MIME_TYPE,
+                            mimeType = resolvedMimeType,
                         ),
                     )
                 } catch (e: Exception) {
@@ -123,9 +134,8 @@ class DownloadHandler(
                 }
             }
             "blob" -> {
-                if (onRequestPageBlobDownload != null) {
-                    onRequestPageBlobDownload(url, fileName)
-                } else {
+                val dispatched = onRequestPageBlobDownload?.invoke(url, fileName) == true
+                if (!dispatched) {
                     showToast(R.string.download_not_supported)
                 }
             }
@@ -141,17 +151,18 @@ class DownloadHandler(
         if (isCleanedUp || id.isNullOrBlank()) return false
         runCatching { activeBlobDownloads.remove(id)?.close(deleteFile = true) }
         return try {
-            val normalizedMimeType = normalizeDownloadMimeType(mimeType)
+            val sanitizedName = sanitizeDownloadFileName(fileName)
+            val resolvedMimeType = resolveDownloadMimeType(mimeType, sanitizedName)
             val resolvedFileName = ensureDownloadExtension(
-                fileName = sanitizeDownloadFileName(fileName),
-                mimeType = normalizedMimeType,
+                fileName = sanitizedName,
+                mimeType = resolvedMimeType,
             )
             val tempFile = createTempDownloadFile(appContext.cacheDir)
             activeBlobDownloads[id] = BlobDownloadSession(
                 tempFile = tempFile,
                 output = FileOutputStream(tempFile),
                 fileName = resolvedFileName,
-                mimeType = normalizedMimeType,
+                mimeType = resolvedMimeType,
             )
             showToast(R.string.download_started)
             true
@@ -411,9 +422,11 @@ class DownloadHandler(
 
         val metadata = dataUrl.substring(5, commaIndex)
         val payload = dataUrl.substring(commaIndex + 1)
-        val mimeType = mimeTypeFromDataUrl(dataUrl)
-            ?: normalizeDownloadMimeTypeOrNull(fallbackMimeType)
-            ?: DEFAULT_DOWNLOAD_MIME_TYPE
+        val sanitizedName = sanitizeDownloadFileName(fileName)
+        val mimeType = resolveDownloadMimeType(
+            rawMimeType = mimeTypeFromDataUrl(dataUrl) ?: fallbackMimeType,
+            fileName = sanitizedName,
+        )
         val tempFile = createTempDownloadFile(cacheDirectory)
 
         try {
@@ -436,7 +449,7 @@ class DownloadHandler(
 
         return PendingDownload(
             tempFile = tempFile,
-            fileName = ensureDownloadExtension(sanitizeDownloadFileName(fileName), mimeType),
+            fileName = ensureDownloadExtension(sanitizedName, mimeType),
             mimeType = mimeType,
         )
     }
@@ -590,28 +603,72 @@ private fun normalizeDownloadMimeTypeOrNull(raw: String?): String? {
     return candidate
 }
 
-private fun normalizeDownloadMimeType(raw: String?): String =
-    normalizeDownloadMimeTypeOrNull(raw) ?: DEFAULT_DOWNLOAD_MIME_TYPE
+private fun resolveDownloadMimeType(rawMimeType: String?, fileName: String): String {
+    val normalized = normalizeDownloadMimeTypeOrNull(rawMimeType)
+    if (normalized != null && normalized !in GENERIC_BINARY_MIME_TYPES) {
+        return normalized
+    }
+    return inferMimeTypeFromFileName(fileName) ?: normalized ?: DEFAULT_DOWNLOAD_MIME_TYPE
+}
+
+private fun inferMimeTypeFromFileName(fileName: String): String? {
+    val dotIndex = fileName.lastIndexOf('.')
+    if (dotIndex <= 0 || dotIndex >= fileName.lastIndex) return null
+    val extension = fileName.substring(dotIndex + 1).lowercase(Locale.US)
+    if (!Regex("""^[a-z0-9]{1,8}$""").matches(extension)) return null
+    return MimeTypeMap.getSingleton()
+        .getMimeTypeFromExtension(extension)
+        ?.let(::normalizeDownloadMimeTypeOrNull)
+}
+
+private fun hasFileExtension(fileName: String): Boolean {
+    val dotIndex = fileName.lastIndexOf('.')
+    if (dotIndex <= 0 || dotIndex >= fileName.lastIndex) return false
+    val extension = fileName.substring(dotIndex + 1)
+    if (!Regex("""^[a-zA-Z0-9]{1,8}$""").matches(extension)) return false
+    if (extension.all { it.isDigit() }) return false
+    return true
+}
 
 private fun ensureDownloadExtension(fileName: String, mimeType: String?): String {
-    if (fileName.contains('.')) return fileName
+    if (hasFileExtension(fileName)) return fileName
     val normalizedMime = normalizeDownloadMimeTypeOrNull(mimeType) ?: return fileName
-    if (normalizedMime == DEFAULT_DOWNLOAD_MIME_TYPE) return fileName
+    if (normalizedMime in GENERIC_BINARY_MIME_TYPES) return fileName
     val extension = MimeTypeMap.getSingleton()
         .getExtensionFromMimeType(normalizedMime)
         ?.takeIf { it.isNotBlank() }
         ?: return fileName
-    return "$fileName.$extension".take(180)
+    val suffix = ".$extension"
+    val maxBaseLength = (MAX_DOWNLOAD_FILE_NAME_LENGTH - suffix.length).coerceAtLeast(1)
+    val baseName = fileName.take(maxBaseLength).trimEnd('.', ' ').ifEmpty { "download" }
+    return "$baseName$suffix"
 }
 
 private fun sanitizeDownloadFileName(fileName: String?): String {
     val cleanName = fileName
         ?.substringAfterLast('/')
-        ?.replace(Regex("""[\\:*?"<>|]"""), "_")
+        ?.replace(Regex("""[\u0000-\u001F\\:*?"<>|]"""), "_")
+        ?.trim()
+        ?.trimEnd('.')
         ?.trim()
         ?.takeIf { it.isNotEmpty() && it != "." && it != ".." }
         ?: "download"
-    return cleanName.take(180)
+    return truncatePreservingExtension(cleanName, MAX_DOWNLOAD_FILE_NAME_LENGTH)
+}
+
+private fun truncatePreservingExtension(fileName: String, maxLength: Int): String {
+    if (fileName.length <= maxLength) return fileName
+    if (hasFileExtension(fileName)) {
+        val dotIndex = fileName.lastIndexOf('.')
+        val suffix = fileName.substring(dotIndex)
+        val maxBaseLength = (maxLength - suffix.length).coerceAtLeast(1)
+        val baseName = fileName.substring(0, dotIndex)
+            .take(maxBaseLength)
+            .trimEnd('.', ' ')
+            .ifEmpty { "download" }
+        return "$baseName$suffix"
+    }
+    return fileName.take(maxLength).trimEnd('.', ' ').ifEmpty { "download" }
 }
 
 private fun uniqueDownloadFile(directory: File, fileName: String): File {

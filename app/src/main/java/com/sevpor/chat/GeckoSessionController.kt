@@ -167,9 +167,10 @@ class GeckoSessionController(
         mainLoadError = null
         if (!mainSession.isOpen) {
             mainSession.open(currentRuntime())
-            attachBuiltInExtensionBridge(mainSession, isPopup = false)
+            loadMainSessionWithExtension(targetUrl)
+        } else {
+            mainSession.loadUri(targetUrl)
         }
-        mainSession.loadUri(targetUrl)
         syncActiveState()
     }
 
@@ -312,20 +313,27 @@ class GeckoSessionController(
     }
 
     private fun startInitialLoadWithExtension() {
-        val initialLoadStarted = AtomicBoolean(false)
+        loadMainSessionWithExtension(WEBSITE)
+    }
+
+    private fun loadMainSessionWithExtension(targetUrl: String) {
+        pendingInitialLoadTimeout?.let(mainHandler::removeCallbacks)
+        pendingInitialLoadTimeout = null
+
+        val loadStarted = AtomicBoolean(false)
         val startLoadOnce = {
-            if (!isClosed && initialLoadStarted.compareAndSet(false, true)) {
+            if (!isClosed && loadStarted.compareAndSet(false, true)) {
                 pendingInitialLoadTimeout?.let(mainHandler::removeCallbacks)
                 pendingInitialLoadTimeout = null
                 if (mainSession.isOpen) {
-                    mainSession.loadUri(WEBSITE)
+                    mainSession.loadUri(targetUrl)
                 }
             }
         }
 
         val timeoutRunnable = Runnable {
-            if (!isClosed && initialLoadStarted.get().not()) {
-                Log.w(TAG, "Built-in extension install timed out; loading homepage without waiting")
+            if (!isClosed && loadStarted.get().not()) {
+                Log.w(TAG, "Built-in extension install timed out; loading page without waiting")
                 startLoadOnce()
             }
         }
@@ -373,6 +381,7 @@ class GeckoSessionController(
                     ?: return GeckoResult.allow()
                 return when (uri.scheme?.lowercase(Locale.US)) {
                     "http", "https", "about", "data", "blob", "javascript" -> GeckoResult.allow()
+                    "file", "content" -> GeckoResult.deny()
                     "intent" -> {
                         openIntentUri(activity, session, uri)
                         GeckoResult.deny()
@@ -388,6 +397,10 @@ class GeckoSessionController(
                 session: GeckoSession,
                 uri: String,
             ): GeckoResult<GeckoSession> {
+                if (isClosed) return GeckoResult.fromValue(null)
+                if (isFullScreen) {
+                    exitFullScreen()
+                }
                 closePopupSession()
                 val newPopup = GeckoSession(GeckoRuntimeHolder.defaultSessionSettings())
                 configureSession(newPopup, isPopup = true)
@@ -463,7 +476,7 @@ class GeckoSessionController(
     private fun createContentDelegate(isPopup: Boolean): ContentDelegate =
         object : ContentDelegate {
             override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
-                val requestPageDownload: (String, String) -> Unit = { blobUrl, fileName ->
+                val requestPageDownload: (String, String) -> Boolean = { blobUrl, fileName ->
                     val port = if (isPopup) popupBridgePort else mainBridgePort
                     val currentUrl = if (isPopup) lastPopupUrl else lastMainUrl
                     if (port != null && isTrustedWebUrl(currentUrl)) {
@@ -474,7 +487,12 @@ class GeckoSessionController(
                                     .put("url", blobUrl)
                                     .put("fileName", fileName),
                             )
-                        }.onFailure { Log.w(TAG, "Unable to trigger page blob download", it) }
+                            true
+                        }.onFailure {
+                            Log.w(TAG, "Unable to trigger page blob download", it)
+                        }.getOrDefault(false)
+                    } else {
+                        false
                     }
                 }
                 downloadHandler.handleExternalResponse(response, requestPageDownload)
@@ -640,6 +658,10 @@ class GeckoSessionController(
     ) {
         val messageDelegate = object : WebExtension.MessageDelegate {
             override fun onConnect(port: WebExtension.Port) {
+                if (isClosed || (isPopup && session !== popupSession)) {
+                    port.disconnect()
+                    return
+                }
                 if (!isTrustedWebUrl(port.sender.url) || !port.sender.isTopLevel()) {
                     Log.w(TAG, "Rejected sevpor_bridge port from untrusted sender: ${port.sender.url}")
                     port.disconnect()
@@ -726,7 +748,7 @@ class GeckoSessionController(
         }
 
         GeckoRuntimeHolder.withBuiltInExtensionReady { extension ->
-            if (!isClosed && extension != null) {
+            if (!isClosed && extension != null && (!isPopup || session === popupSession)) {
                 session.webExtensionController.setMessageDelegate(
                     extension,
                     messageDelegate,
@@ -750,14 +772,17 @@ class GeckoSessionController(
         }
         mainLoadError = null
         cancelPendingGoBack()
+        runCatching { mainBridgePort?.disconnect() }
         mainBridgePort = null
         sevporNavCanGoBack = false
 
+        val targetUrl = lastMainUrl ?: WEBSITE
         if (!session.isOpen) {
             session.open(currentRuntime())
-            attachBuiltInExtensionBridge(session, isPopup = false)
+            loadMainSessionWithExtension(targetUrl)
+        } else {
+            session.loadUri(targetUrl)
         }
-        session.loadUri(lastMainUrl ?: WEBSITE)
         syncActiveState()
     }
 
@@ -798,6 +823,12 @@ private fun openIntentUri(context: Context, session: GeckoSession, uri: Uri) {
             addCategory(Intent.CATEGORY_BROWSABLE)
             component = null
             selector = null
+            flags = flags and (
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+                ).inv()
         }
         try {
             launchExternalActivity(context, intent)
@@ -806,7 +837,8 @@ private fun openIntentUri(context: Context, session: GeckoSession, uri: Uri) {
             // Fall through to browser_fallback_url if no matching app is installed.
         }
         intent.getStringExtra("browser_fallback_url")?.let { fallbackUrl ->
-            if (session.isOpen) {
+            val fallbackScheme = runCatching { Uri.parse(fallbackUrl).scheme?.lowercase(Locale.US) }.getOrNull()
+            if ((fallbackScheme == "http" || fallbackScheme == "https") && session.isOpen) {
                 session.loadUri(fallbackUrl)
             }
         }
@@ -817,9 +849,12 @@ private fun openIntentUri(context: Context, session: GeckoSession, uri: Uri) {
 
 private fun openExternalUri(context: Context, uri: Uri) {
     try {
-        launchExternalActivity(context, Intent(Intent.ACTION_VIEW, uri))
-    } catch (e: ActivityNotFoundException) {
-        Log.w(TAG, "No app can open URI: $uri", e)
+        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+            addCategory(Intent.CATEGORY_BROWSABLE)
+        }
+        launchExternalActivity(context, intent)
+    } catch (e: Exception) {
+        Log.w(TAG, "Unable to open external URI: $uri", e)
     }
 }
 

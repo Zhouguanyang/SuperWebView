@@ -239,6 +239,7 @@
   function sendPageDownload(pageUrl, fileName) {
     var id = nextDownloadId();
     var started = false;
+    var nativeNotifiedFailure = false;
     return pageFetch(pageUrl)
       .then(function (response) {
         if (!response.ok) {
@@ -253,7 +254,12 @@
           mimeType: blob.type || DEFAULT_MIME_TYPE,
           fileName: fileName || 'download'
         }).then(function (response) {
-          assertOk(response, 'Native download rejected');
+          if (!response || response.ok !== true) {
+            if (response && response.ok === false) {
+              nativeNotifiedFailure = true;
+            }
+            throw new Error('Native download rejected');
+          }
           started = true;
           return sendBlobChunks(id, blob);
         }).then(function () {
@@ -268,7 +274,7 @@
       .catch(function (error) {
         if (started) {
           sendNative({ type: 'cancelDownload', id: id }).catch(function () {});
-        } else {
+        } else if (!nativeNotifiedFailure) {
           sendNative({ type: 'downloadFailed' }).catch(function () {});
         }
         console.error('Sevpor GeckoView download failed', error);

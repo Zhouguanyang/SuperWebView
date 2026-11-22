@@ -68,7 +68,7 @@ class FileChooserHandler(
         })
 
         if (prompt.type == FilePrompt.Type.FOLDER) {
-            launchPickerSafely(prompt, createFolderChooserIntent())
+            launchPickerSafely(prompt) { createFolderChooserIntent() }
             return result
         }
 
@@ -81,12 +81,12 @@ class FileChooserHandler(
                     dismissPromptSafely(prompt, deleteCaptureFile = true)
                     return@requestPermissions
                 }
-                launchPickerSafely(prompt, createFileChooserIntent(prompt))
+                launchPickerSafely(prompt) { createFileChooserIntent(prompt) }
             }
             return result
         }
 
-        launchPickerSafely(prompt, createFileChooserIntent(prompt))
+        launchPickerSafely(prompt) { createFileChooserIntent(prompt) }
         return result
     }
 
@@ -123,6 +123,7 @@ class FileChooserHandler(
             val isDirectCaptureResult =
                 captureFile != null &&
                     captureFile.exists() &&
+                    captureFile.length() > 0L &&
                     (selectedUris == null || (selectedUris.size == 1 && selectedUris[0] == pendingCaptureUri))
             if (isDirectCaptureResult) {
                 val fileUri = Uri.fromFile(captureFile)
@@ -162,7 +163,7 @@ class FileChooserHandler(
                         Log.e(TAG, "Unable to confirm selected files", e)
                         if (!prompt.isComplete) prompt.dismiss() else null
                     }
-                    completePending(response, deleteCaptureFile = false)
+                    completePending(response, deleteCaptureFile = true)
                 }
             }
             if (!queued && pendingPrompt === prompt) {
@@ -288,9 +289,9 @@ class FileChooserHandler(
         }
     }
 
-    private fun launchPickerSafely(prompt: FilePrompt, intent: Intent) {
+    private fun launchPickerSafely(prompt: FilePrompt, createIntent: () -> Intent) {
         try {
-            launchIntent(intent)
+            launchIntent(createIntent())
         } catch (e: ActivityNotFoundException) {
             Log.e(TAG, "No file chooser available", e)
             dismissPromptSafely(prompt, deleteCaptureFile = true)
@@ -420,6 +421,8 @@ class FileChooserHandler(
 
     private fun parseCaptureOutputUri(resultCode: Int): Array<Uri>? {
         if (resultCode != Activity.RESULT_OK) return null
+        val file = pendingCaptureFile ?: return null
+        if (!file.exists() || file.length() <= 0L) return null
         return pendingCaptureUri?.let { arrayOf(it) }
     }
 
